@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [tcpserver-master-build]
+  pull_request:
+    branches: [tcpserver-master-build]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test
