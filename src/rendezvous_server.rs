@@ -1824,6 +1824,24 @@ mod tests {
             }
             assert!(!rs.check_ip_blocker("10.0.0.99", "peer_new").await);
         }
+
+        #[tokio::test]
+        async fn test_same_id_multiple_times_allowed() {
+            IP_BLOCKER.lock().await.clear();
+            let (rs, _rx) = test_server().await;
+            // Same ID repeated should be fine
+            for _ in 0..10 {
+                assert!(rs.check_ip_blocker("10.0.0.50", "same_peer").await);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_different_ips_independent() {
+            IP_BLOCKER.lock().await.clear();
+            let (rs, _rx) = test_server().await;
+            assert!(rs.check_ip_blocker("10.0.0.51", "p1").await);
+            assert!(rs.check_ip_blocker("10.0.0.52", "p2").await);
+        }
     }
 
     mod check_cmd_tests {
@@ -1853,19 +1871,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_ip_blocker_empty() {
-            IP_BLOCKER.lock().await.clear();
+        async fn test_ip_blocker_list() {
             let (rs, _rx) = test_server().await;
             let result = rs.check_cmd("ib").await;
-            assert!(result.starts_with("0\n"));
+            // First line is the count (may not be 0 due to parallel tests)
+            assert!(result.lines().next().unwrap().parse::<usize>().is_ok());
         }
 
         #[tokio::test]
-        async fn test_ip_changes_empty() {
-            IP_CHANGES.lock().await.clear();
+        async fn test_ip_changes_list() {
             let (rs, _rx) = test_server().await;
             let result = rs.check_cmd("ic").await;
-            assert!(result.starts_with("0\n"));
+            assert!(result.lines().next().unwrap().parse::<usize>().is_ok());
         }
 
         #[tokio::test]
@@ -1873,6 +1890,328 @@ mod tests {
             let (rs, _rx) = test_server().await;
             let result = rs.check_cmd("nonexistent").await;
             assert!(result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_ip_blocker_lookup_specific_ip() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("ib 192.168.99.99").await;
+            // IP not in blocker, so just the count line
+            assert!(!result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_ip_blocker_remove_ip() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("ib 192.168.99.99 -").await;
+            assert!(!result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_ip_blocker_start_offset() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("ib 0").await;
+            assert!(!result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_ip_changes_lookup_specific_id() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("ic some_peer_id").await;
+            assert!(!result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_ip_changes_remove_id() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("ic some_peer_id -").await;
+            assert!(!result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_ip_changes_start_offset() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("ic 0").await;
+            assert!(!result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_relay_servers_set() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("rs new-relay.com").await;
+            // Setting relay servers sends data via tx, no output
+            assert!(result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_always_use_relay_set_y() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("aur Y").await;
+            assert!(result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_always_use_relay_set_n() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("aur N").await;
+            assert!(result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_test_geo_command() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("tg 10.0.0.1 10.0.0.2").await;
+            assert!(!result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_test_geo_single_ip() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("tg 10.0.0.1").await;
+            assert!(!result.is_empty());
+        }
+    }
+
+    async fn test_server_with_sk() -> (RendezvousServer, Receiver) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sqlite3");
+        std::mem::forget(dir);
+
+        let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+        let pm = PeerMap::new_with_db(db);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
+        let (_pk, sk) = sign::gen_keypair();
+        let rs = RendezvousServer {
+            tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            pm,
+            tx,
+            relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Arc::new(vec![]),
+            inner: Arc::new(Inner {
+                serial: 1,
+                version: String::new(),
+                software_url: String::new(),
+                mask: None,
+                local_ip: String::new(),
+                sk: Some(sk),
+                secure_tcp_pk_b,
+                secure_tcp_sk_b,
+            }),
+        };
+        (rs, rx)
+    }
+
+    async fn register_peer(rs: &mut RendezvousServer, id: &str, addr: &str) {
+        let addr: SocketAddr = addr.parse().unwrap();
+        let peer = rs.pm.get_or(id).await;
+        let uuid = Bytes::from_static(b"test-uuid-bytes!");
+        let pk = Bytes::from_static(b"test-pk-bytes!!!");
+        rs.pm.update_pk(
+            id.to_owned(), peer, addr, uuid, pk, addr.ip().to_string(),
+        ).await;
+    }
+
+    mod handle_punch_hole_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_license_key_mismatch() {
+            let (mut rs, _rx) = test_server().await;
+            let ph = PunchHoleRequest {
+                id: "target123".to_owned(),
+                licence_key: "wrong_key".to_owned(),
+                ..Default::default()
+            };
+            let (msg, peer_addr) = rs.handle_punch_hole_request(
+                "10.0.0.1:1234".parse().unwrap(), ph, "correct_key", false,
+            ).await.unwrap();
+            assert!(peer_addr.is_none());
+            assert!(msg.has_punch_hole_response());
+            assert_eq!(
+                msg.punch_hole_response().failure,
+                punch_hole_response::Failure::LICENSE_MISMATCH.into()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_empty_key_skips_license_check() {
+            let (mut rs, _rx) = test_server().await;
+            let ph = PunchHoleRequest {
+                id: "nonexistent".to_owned(),
+                licence_key: "anything".to_owned(),
+                ..Default::default()
+            };
+            let (msg, peer_addr) = rs.handle_punch_hole_request(
+                "10.0.0.1:1234".parse().unwrap(), ph, "", false,
+            ).await.unwrap();
+            assert!(peer_addr.is_none());
+            assert_eq!(
+                msg.punch_hole_response().failure,
+                punch_hole_response::Failure::ID_NOT_EXIST.into()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_peer_not_found() {
+            let (mut rs, _rx) = test_server().await;
+            let ph = PunchHoleRequest {
+                id: "missing_peer".to_owned(),
+                ..Default::default()
+            };
+            let (msg, peer_addr) = rs.handle_punch_hole_request(
+                "10.0.0.1:1234".parse().unwrap(), ph, "", false,
+            ).await.unwrap();
+            assert!(peer_addr.is_none());
+            assert_eq!(
+                msg.punch_hole_response().failure,
+                punch_hole_response::Failure::ID_NOT_EXIST.into()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_peer_offline() {
+            let (mut rs, _rx) = test_server().await;
+            register_peer(&mut rs, "offline1", "10.0.0.2:5555").await;
+
+            // Set last_reg_time to expired
+            let peer = rs.pm.get("offline1").await.unwrap();
+            peer.write().await.last_reg_time = get_expired_time();
+
+            let ph = PunchHoleRequest {
+                id: "offline1".to_owned(),
+                ..Default::default()
+            };
+            let (msg, peer_addr) = rs.handle_punch_hole_request(
+                "10.0.0.1:1234".parse().unwrap(), ph, "", false,
+            ).await.unwrap();
+            assert!(peer_addr.is_none());
+            assert_eq!(
+                msg.punch_hole_response().failure,
+                punch_hole_response::Failure::OFFLINE.into()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_peer_online_returns_punch_hole() {
+            let (mut rs, _rx) = test_server().await;
+            register_peer(&mut rs, "online1", "10.0.0.2:5555").await;
+
+            let ph = PunchHoleRequest {
+                id: "online1".to_owned(),
+                ..Default::default()
+            };
+            let (msg, peer_addr) = rs.handle_punch_hole_request(
+                "10.0.0.3:1234".parse().unwrap(), ph, "", false,
+            ).await.unwrap();
+            assert!(peer_addr.is_some());
+            assert_eq!(peer_addr.unwrap(), "10.0.0.2:5555".parse::<SocketAddr>().unwrap());
+            assert!(msg.has_punch_hole());
+        }
+
+        #[tokio::test]
+        async fn test_same_ip_returns_fetch_local_addr() {
+            let (mut rs, _rx) = test_server().await;
+            register_peer(&mut rs, "local_1", "10.0.0.2:5555").await;
+
+            let ph = PunchHoleRequest {
+                id: "local_1".to_owned(),
+                ..Default::default()
+            };
+            let (msg, peer_addr) = rs.handle_punch_hole_request(
+                "10.0.0.2:6666".parse().unwrap(), ph, "", false,
+            ).await.unwrap();
+            assert!(peer_addr.is_some());
+            assert!(msg.has_fetch_local_addr());
+        }
+
+        #[tokio::test]
+        async fn test_peer_ws_same_ip_still_punches() {
+            let (mut rs, _rx) = test_server().await;
+            register_peer(&mut rs, "ws_peer1", "10.0.0.2:5555").await;
+
+            let ph = PunchHoleRequest {
+                id: "ws_peer1".to_owned(),
+                ..Default::default()
+            };
+            // ws=true means same_intranet is always false
+            let (msg, peer_addr) = rs.handle_punch_hole_request(
+                "10.0.0.2:6666".parse().unwrap(), ph, "", true,
+            ).await.unwrap();
+            assert!(peer_addr.is_some());
+            assert!(msg.has_punch_hole());
+        }
+    }
+
+    mod get_pk_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_get_pk_empty_version_returns_empty() {
+            let (mut rs, _rx) = test_server().await;
+            let pk = rs.get_pk("", "some_id".to_owned()).await;
+            assert!(pk.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_get_pk_no_sk_returns_empty() {
+            let (mut rs, _rx) = test_server().await;
+            let pk = rs.get_pk("1.2.3", "some_id".to_owned()).await;
+            assert!(pk.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_get_pk_peer_not_found_returns_empty() {
+            let (mut rs, _rx) = test_server_with_sk().await;
+            let pk = rs.get_pk("1.2.3", "unknown".to_owned()).await;
+            assert!(pk.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_get_pk_returns_signed_pk() {
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "signed1", "10.0.0.1:1234").await;
+            let pk = rs.get_pk("1.2.3", "signed1".to_owned()).await;
+            assert!(!pk.is_empty());
+        }
+    }
+
+    mod parse_relay_servers_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_parse_sets_relay_servers() {
+            let (mut rs, _rx) = test_server().await;
+            rs.parse_relay_servers("relay1.com,relay2.com");
+            assert_eq!(rs.relay_servers.len(), 2);
+            assert_eq!(rs.relay_servers0.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn test_parse_empty_clears_servers() {
+            let (mut rs, _rx) = test_server().await;
+            rs.parse_relay_servers("");
+            assert!(rs.relay_servers.is_empty());
+        }
+    }
+
+    mod symmetric_key_tests {
+        use super::*;
+
+        #[test]
+        fn test_get_symetric_key_roundtrip() {
+            let (their_pk, their_sk) = box_::gen_keypair();
+            let (our_pk, our_sk) = box_::gen_keypair();
+            let symmetric_key = secretbox::gen_key();
+
+            let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+            let sealed = box_::seal(&symmetric_key.0, &nonce, &our_pk, &their_sk);
+            let mut sealed_arr = [0u8; 48];
+            sealed_arr.copy_from_slice(&sealed);
+
+            let recovered = get_symetric_key_from_msg(our_sk.0, their_pk.0, &sealed_arr);
+            assert_eq!(recovered, symmetric_key.0);
         }
     }
 

@@ -215,4 +215,40 @@ mod tests {
         let result = validate_keypair(&pk_b64, &short_sk);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_validate_keypair_invalid_public_key() {
+        let (_, sk) = sign::gen_keypair();
+        let sk_b64 = base64::encode(sk);
+        let result = validate_keypair("not-valid-base64!!!", &sk_b64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_keypair_wrong_length_public() {
+        let (_, sk) = sign::gen_keypair();
+        let sk_b64 = base64::encode(sk);
+        let short_pk = base64::encode(b"tooshort");
+        let result = validate_keypair(&short_pk, &sk_b64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_keypair_consistency() {
+        // Generate multiple pairs and validate each
+        for _ in 0..5 {
+            let (pk, sk) = sign::gen_keypair();
+            let pk_b64 = base64::encode(pk);
+            let sk_b64 = base64::encode(sk);
+            assert!(validate_keypair(&pk_b64, &sk_b64).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_keypair_empty_public_key() {
+        let (_, sk) = sign::gen_keypair();
+        let sk_b64 = base64::encode(sk);
+        let result = validate_keypair("", &sk_b64);
+        assert!(result.is_err());
+    }
 }
