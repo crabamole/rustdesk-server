@@ -177,4 +177,190 @@ impl PeerMap {
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_db(db: database::Database) -> Self {
+        PeerMap {
+            map: Default::default(),
+            db,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio;
+
+    async fn temp_peer_map() -> PeerMap {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sqlite3");
+        let db = database::Database::new(path.to_str().unwrap()).await.unwrap();
+        std::mem::forget(dir);
+        PeerMap::new_with_db(db)
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_none_for_unknown_peer() {
+        let pm = temp_peer_map().await;
+        assert!(pm.get("unknown_peer").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_or_creates_default_peer() {
+        let pm = temp_peer_map().await;
+        let peer = pm.get_or("new_peer").await;
+        let r = peer.read().await;
+        assert!(r.uuid.is_empty());
+        assert!(r.pk.is_empty());
+        assert!(r.guid.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_or_returns_same_peer_on_second_call() {
+        let pm = temp_peer_map().await;
+        let p1 = pm.get_or("peer1").await;
+        let p2 = pm.get_or("peer1").await;
+        assert!(Arc::ptr_eq(&p1, &p2));
+    }
+
+    #[tokio::test]
+    async fn test_is_in_memory_after_get_or() {
+        let pm = temp_peer_map().await;
+        assert!(!pm.is_in_memory("peer2").await);
+        let _ = pm.get_or("peer2").await;
+        assert!(pm.is_in_memory("peer2").await);
+    }
+
+    #[tokio::test]
+    async fn test_get_in_memory_returns_none_before_insert() {
+        let pm = temp_peer_map().await;
+        assert!(pm.get_in_memory("peer3").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_in_memory_returns_some_after_get_or() {
+        let pm = temp_peer_map().await;
+        let _ = pm.get_or("peer4").await;
+        assert!(pm.get_in_memory("peer4").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_pk_inserts_new_peer_to_db() {
+        let mut pm = temp_peer_map().await;
+        let peer = pm.get_or("peer5").await;
+        let uuid = Bytes::from_static(b"test-uuid-bytes!");
+        let pk = Bytes::from_static(b"test-pk-bytes!!!");
+        let addr: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+
+        let result = pm.update_pk(
+            "peer5".to_owned(),
+            peer.clone(),
+            addr,
+            uuid,
+            pk,
+            "10.0.0.1".to_owned(),
+        ).await;
+        assert_eq!(result, register_pk_response::Result::OK);
+
+        let r = peer.read().await;
+        assert!(!r.guid.is_empty());
+        assert_eq!(r.socket_addr, addr);
+        assert_eq!(r.info.ip, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn test_update_pk_updates_existing_peer() {
+        let mut pm = temp_peer_map().await;
+        let peer = pm.get_or("peer6").await;
+        let uuid = Bytes::from_static(b"test-uuid-bytes!");
+        let pk1 = Bytes::from_static(b"test-pk1-bytes!!");
+        let pk2 = Bytes::from_static(b"test-pk2-bytes!!");
+        let addr: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+
+        // First insert
+        let result = pm.update_pk(
+            "peer6".to_owned(),
+            peer.clone(),
+            addr,
+            uuid.clone(),
+            pk1,
+            "10.0.0.1".to_owned(),
+        ).await;
+        assert_eq!(result, register_pk_response::Result::OK);
+
+        // Second update (guid is now set)
+        let result = pm.update_pk(
+            "peer6".to_owned(),
+            peer.clone(),
+            addr,
+            uuid,
+            pk2.clone(),
+            "10.0.0.2".to_owned(),
+        ).await;
+        assert_eq!(result, register_pk_response::Result::OK);
+
+        let r = peer.read().await;
+        assert_eq!(r.pk, pk2);
+        assert_eq!(r.info.ip, "10.0.0.2");
+    }
+
+    #[tokio::test]
+    async fn test_get_loads_peer_from_db() {
+        let mut pm = temp_peer_map().await;
+        let peer = pm.get_or("db_peer").await;
+        let uuid = Bytes::from_static(b"test-uuid-bytes!");
+        let pk = Bytes::from_static(b"test-pk-bytes!!!");
+        let addr: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+
+        pm.update_pk(
+            "db_peer".to_owned(),
+            peer,
+            addr,
+            uuid.clone(),
+            pk.clone(),
+            "10.0.0.1".to_owned(),
+        ).await;
+
+        // Clear in-memory map to force DB lookup
+        pm.map.write().await.clear();
+        assert!(!pm.is_in_memory("db_peer").await);
+
+        // get() should load from DB
+        let loaded = pm.get("db_peer").await;
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        let r = loaded.read().await;
+        assert_eq!(r.uuid, uuid);
+        assert_eq!(r.pk, pk);
+    }
+
+    #[tokio::test]
+    async fn test_peer_default() {
+        let peer = Peer::default();
+        assert_eq!(peer.socket_addr, "0.0.0.0:0".parse::<SocketAddr>().unwrap());
+        assert!(peer.uuid.is_empty());
+        assert!(peer.pk.is_empty());
+        assert!(peer.guid.is_empty());
+        assert!(peer.info.ip.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_peer_info_serialization() {
+        let info = PeerInfo { ip: "192.168.1.1".to_owned() };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("192.168.1.1"));
+
+        let deserialized: PeerInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.ip, "192.168.1.1");
+    }
+
+    #[tokio::test]
+    async fn test_peer_info_default() {
+        let info = PeerInfo::default();
+        assert!(info.ip.is_empty());
+
+        let deserialized: PeerInfo = serde_json::from_str("{}").unwrap();
+        assert!(deserialized.ip.is_empty());
+    }
 }

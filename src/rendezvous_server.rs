@@ -1669,6 +1669,213 @@ mod tests {
         }
     }
 
+    async fn test_server() -> (RendezvousServer, Receiver) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sqlite3");
+        std::mem::forget(dir);
+
+        let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+        let pm = PeerMap::new_with_db(db);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
+        let rs = RendezvousServer {
+            tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            pm,
+            tx,
+            relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Arc::new(vec![]),
+            inner: Arc::new(Inner {
+                serial: 1,
+                version: String::new(),
+                software_url: String::new(),
+                mask: None,
+                local_ip: String::new(),
+                sk: None,
+                secure_tcp_pk_b,
+                secure_tcp_sk_b,
+            }),
+        };
+        (rs, rx)
+    }
+
+    mod handle_register_pk_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_register_pk_empty_uuid_rejected() {
+            let (mut rs, _rx) = test_server().await;
+            let rk = RegisterPk {
+                id: "testpeer".to_owned(),
+                uuid: vec![].into(),
+                pk: vec![1, 2, 3].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, "10.0.0.1:1234".parse().unwrap()).await;
+            assert_eq!(result, Err(INVALID_ID_FORMAT));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_empty_pk_rejected() {
+            let (mut rs, _rx) = test_server().await;
+            let rk = RegisterPk {
+                id: "testpeer".to_owned(),
+                uuid: vec![1, 2, 3].into(),
+                pk: vec![].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, "10.0.0.1:1234".parse().unwrap()).await;
+            assert_eq!(result, Err(INVALID_ID_FORMAT));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_short_id_rejected() {
+            let (mut rs, _rx) = test_server().await;
+            let rk = RegisterPk {
+                id: "short".to_owned(),
+                uuid: vec![1, 2, 3].into(),
+                pk: vec![1, 2, 3].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, "10.0.0.1:1234".parse().unwrap()).await;
+            assert_eq!(result, Err(UUID_MISMATCH));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_new_peer_succeeds() {
+            let (mut rs, _rx) = test_server().await;
+            let rk = RegisterPk {
+                id: "newpeer123".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, "10.0.0.1:1234".parse().unwrap()).await;
+            assert_eq!(result, Ok(register_pk_response::Result::OK));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_same_uuid_updates() {
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+
+            // First registration
+            let rk = RegisterPk {
+                id: "peer_upd".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, addr).await;
+            assert_eq!(result, Ok(register_pk_response::Result::OK));
+
+            // Second registration with same uuid
+            let rk = RegisterPk {
+                id: "peer_upd".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![3; 32].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, addr).await;
+            assert_eq!(result, Ok(register_pk_response::Result::OK));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_uuid_mismatch_rejected() {
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+
+            let rk = RegisterPk {
+                id: "peer_mm".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            rs.handle_register_pk(rk, addr).await.unwrap();
+
+            // Different uuid
+            let rk = RegisterPk {
+                id: "peer_mm".to_owned(),
+                uuid: vec![9; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, addr).await;
+            assert_eq!(result, Err(UUID_MISMATCH));
+        }
+    }
+
+    mod check_ip_blocker_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_first_request_allowed() {
+            IP_BLOCKER.lock().await.clear();
+            let (rs, _rx) = test_server().await;
+            assert!(rs.check_ip_blocker("10.0.0.1", "peer1").await);
+        }
+
+        #[tokio::test]
+        async fn test_excessive_requests_blocked() {
+            IP_BLOCKER.lock().await.clear();
+            let (rs, _rx) = test_server().await;
+            for i in 0..35 {
+                let _ = rs.check_ip_blocker("10.0.0.99", &format!("peer{i}")).await;
+            }
+            assert!(!rs.check_ip_blocker("10.0.0.99", "peer_new").await);
+        }
+    }
+
+    mod check_cmd_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_help_command() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("h").await;
+            assert!(result.contains("relay-servers"));
+            assert!(result.contains("ip-blocker"));
+            assert!(result.contains("always-use-relay"));
+        }
+
+        #[tokio::test]
+        async fn test_relay_servers_list() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("rs").await;
+            assert!(result.contains("relay.example.com"));
+        }
+
+        #[tokio::test]
+        async fn test_always_use_relay_query() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("aur").await;
+            assert!(result.contains("ALWAYS_USE_RELAY"));
+        }
+
+        #[tokio::test]
+        async fn test_ip_blocker_empty() {
+            IP_BLOCKER.lock().await.clear();
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("ib").await;
+            assert!(result.starts_with("0\n"));
+        }
+
+        #[tokio::test]
+        async fn test_ip_changes_empty() {
+            IP_CHANGES.lock().await.clear();
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("ic").await;
+            assert!(result.starts_with("0\n"));
+        }
+
+        #[tokio::test]
+        async fn test_unknown_command() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("nonexistent").await;
+            assert!(result.is_empty());
+        }
+    }
+
     mod get_server_sk_tests {
         use super::*;
 
