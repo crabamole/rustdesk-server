@@ -633,3 +633,189 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
 
     fn set_raw(&mut self) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_limiter() -> Limiter {
+        <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _)
+    }
+
+    mod check_cmd_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_help() {
+            let result = check_cmd("h", default_limiter()).await;
+            assert!(result.contains("blacklist"));
+            assert!(result.contains("blocklist"));
+            assert!(result.contains("usage"));
+        }
+
+        #[tokio::test]
+        async fn test_blacklist_add_and_check() {
+            check_cmd("ba 192.168.88.1", default_limiter()).await;
+            let result = check_cmd("b 192.168.88.1", default_limiter()).await;
+            assert!(result.contains("true"));
+            check_cmd("br 192.168.88.1", default_limiter()).await;
+        }
+
+        #[tokio::test]
+        async fn test_blacklist_check_missing() {
+            let result = check_cmd("b 192.168.88.200", default_limiter()).await;
+            assert!(result.contains("false"));
+        }
+
+        #[tokio::test]
+        async fn test_blacklist_remove() {
+            check_cmd("ba 192.168.88.2", default_limiter()).await;
+            check_cmd("br 192.168.88.2", default_limiter()).await;
+            let result = check_cmd("b 192.168.88.2", default_limiter()).await;
+            assert!(result.contains("false"));
+        }
+
+        #[tokio::test]
+        async fn test_blacklist_list_contains_added() {
+            check_cmd("ba 10.99.88.1", default_limiter()).await;
+            let result = check_cmd("b", default_limiter()).await;
+            assert!(result.contains("10.99.88.1"));
+            check_cmd("br 10.99.88.1", default_limiter()).await;
+        }
+
+        #[tokio::test]
+        async fn test_blocklist_add_and_check() {
+            // Use unique IPs to avoid races with parallel tests
+            check_cmd("Ba 172.16.99.1", default_limiter()).await;
+            let result = check_cmd("B 172.16.99.1", default_limiter()).await;
+            assert!(result.contains("true"));
+            // Cleanup
+            check_cmd("Br 172.16.99.1", default_limiter()).await;
+        }
+
+        #[tokio::test]
+        async fn test_blocklist_remove() {
+            check_cmd("Ba 172.16.99.2", default_limiter()).await;
+            check_cmd("Br 172.16.99.2", default_limiter()).await;
+            let result = check_cmd("B 172.16.99.2", default_limiter()).await;
+            assert!(result.contains("false"));
+        }
+
+        #[tokio::test]
+        async fn test_blocklist_list_after_add() {
+            check_cmd("Ba 10.98.99.1", default_limiter()).await;
+            let result = check_cmd("B", default_limiter()).await;
+            assert!(result.contains("10.98.99.1"));
+            check_cmd("Br 10.98.99.1", default_limiter()).await;
+        }
+
+        #[tokio::test]
+        async fn test_downgrade_threshold_query() {
+            let result = check_cmd("dt", default_limiter()).await;
+            assert!(!result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_downgrade_threshold_set() {
+            let result = check_cmd("dt 0.8", default_limiter()).await;
+            assert!(result.is_empty());
+            let result = check_cmd("dt", default_limiter()).await;
+            assert!(result.contains("0.8"));
+            // Reset
+            DOWNGRADE_THRESHOLD_100.store(66, Ordering::SeqCst);
+        }
+
+        #[tokio::test]
+        async fn test_downgrade_start_check_query() {
+            let result = check_cmd("t", default_limiter()).await;
+            assert!(result.contains("s"));
+        }
+
+        #[tokio::test]
+        async fn test_downgrade_start_check_set() {
+            let old = DOWNGRADE_START_CHECK.load(Ordering::SeqCst);
+            check_cmd("t 3600", default_limiter()).await;
+            assert_eq!(DOWNGRADE_START_CHECK.load(Ordering::SeqCst), 3_600_000);
+            DOWNGRADE_START_CHECK.store(old, Ordering::SeqCst);
+        }
+
+        #[tokio::test]
+        async fn test_limit_speed_query() {
+            let result = check_cmd("ls", default_limiter()).await;
+            assert!(result.contains("Mb/s"));
+        }
+
+        #[tokio::test]
+        async fn test_limit_speed_set() {
+            let old = LIMIT_SPEED.load(Ordering::SeqCst);
+            check_cmd("ls 10.0", default_limiter()).await;
+            assert_eq!(LIMIT_SPEED.load(Ordering::SeqCst), (10.0 * 1024. * 1024.) as usize);
+            LIMIT_SPEED.store(old, Ordering::SeqCst);
+        }
+
+        #[tokio::test]
+        async fn test_total_bandwidth_query() {
+            let result = check_cmd("tb", default_limiter()).await;
+            assert!(result.contains("Mb/s"));
+        }
+
+        #[tokio::test]
+        async fn test_single_bandwidth_query() {
+            let result = check_cmd("sb", default_limiter()).await;
+            assert!(result.contains("Mb/s"));
+        }
+
+        #[tokio::test]
+        async fn test_usage_empty() {
+            USAGE.write().await.clear();
+            let result = check_cmd("u", default_limiter()).await;
+            assert!(result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_usage_with_data() {
+            USAGE.write().await.insert("10.0.0.1".to_owned(), (5000, 8000, 100, 50));
+            let result = check_cmd("u", default_limiter()).await;
+            assert!(result.contains("10.0.0.1"));
+            USAGE.write().await.remove("10.0.0.1");
+        }
+
+        #[tokio::test]
+        async fn test_unknown_command() {
+            let result = check_cmd("xyz", default_limiter()).await;
+            assert!(result.is_empty());
+        }
+    }
+
+    mod get_server_sk_tests {
+        use super::*;
+
+        #[test]
+        fn test_valid_secret_key() {
+            let (pk, sk) = sign::gen_keypair();
+            let sk_b64 = base64::encode(&sk);
+            let key = get_server_sk(&sk_b64);
+            assert_eq!(key, base64::encode(pk));
+        }
+
+        #[test]
+        fn test_non_crypto_key_passthrough() {
+            let key = get_server_sk("plain_text_key");
+            assert_eq!(key, "plain_text_key");
+        }
+
+        #[test]
+        fn test_short_base64_not_crypto() {
+            let short = base64::encode(b"short");
+            let key = get_server_sk(&short);
+            assert_eq!(key, short);
+        }
+    }
+
+    #[test]
+    fn test_check_params_no_panic() {
+        // check_params reads env vars and sets atomics
+        // Just verify it doesn't panic with default env
+        check_params();
+    }
+}
