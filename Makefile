@@ -1,0 +1,9 @@
+.DEFAULT_GOAL := help
+
+.PHONY: help test
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
+
+test: ## Run unit + integration tests with coverage
+	cargo llvm-cov --features integration-test --summary-only
