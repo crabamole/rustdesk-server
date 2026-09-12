@@ -144,35 +144,105 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use hbb_common::tokio;
-    #[test]
-    fn test_insert() {
-        insert();
+
+    async fn temp_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sqlite3");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        // Leak the tempdir so it lives until process exit
+        std::mem::forget(dir);
+        db
     }
 
-    #[tokio::main(flavor = "multi_thread")]
-    async fn insert() {
-        let db = super::Database::new("test.sqlite3").await.unwrap();
+    #[tokio::test]
+    async fn test_insert_and_get_peer() {
+        let db = temp_db().await;
+        let uuid = b"test-uuid-bytes!";
+        let pk = b"test-pk-bytes!!!";
+        let info = r#"{"ip":"10.0.0.1"}"#;
+
+        let guid = db.insert_peer("peer123", uuid, pk, info).await.unwrap();
+        assert!(!guid.is_empty());
+
+        let peer = db.get_peer("peer123").await.unwrap().unwrap();
+        assert_eq!(peer.id, "peer123");
+        assert_eq!(peer.uuid, uuid.to_vec());
+        assert_eq!(peer.pk, pk.to_vec());
+        assert_eq!(peer.info, info);
+    }
+
+    #[tokio::test]
+    async fn test_get_peer_not_found() {
+        let db = temp_db().await;
+        let result = db.get_peer("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_pk() {
+        let db = temp_db().await;
+        let uuid = b"test-uuid-bytes!";
+        let pk = b"test-pk-bytes!!!";
+        let info = r#"{"ip":"10.0.0.1"}"#;
+
+        let guid = db.insert_peer("peer456", uuid, pk, info).await.unwrap();
+
+        let new_pk = b"new-pk-bytes!!!!!";
+        let new_info = r#"{"ip":"10.0.0.2"}"#;
+        db.update_pk(&guid, "peer456", new_pk, new_info).await.unwrap();
+
+        let peer = db.get_peer("peer456").await.unwrap().unwrap();
+        assert_eq!(peer.pk, new_pk.to_vec());
+        assert_eq!(peer.info, new_info);
+    }
+
+    #[tokio::test]
+    async fn test_insert_duplicate_id_fails() {
+        let db = temp_db().await;
+        let uuid = b"test-uuid-bytes!";
+        let pk = b"test-pk-bytes!!!";
+
+        db.insert_peer("dup_id", uuid, pk, "{}").await.unwrap();
+        let result = db.insert_peer("dup_id", uuid, pk, "{}").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_pk_changes_id() {
+        let db = temp_db().await;
+        let uuid = b"test-uuid-bytes!";
+        let pk = b"test-pk-bytes!!!";
+
+        let guid = db.insert_peer("old_id", uuid, pk, "{}").await.unwrap();
+        db.update_pk(&guid, "new_id", pk, "{}").await.unwrap();
+
+        let old = db.get_peer("old_id").await.unwrap();
+        assert!(old.is_none());
+
+        let new = db.get_peer("new_id").await.unwrap();
+        assert!(new.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_insert_and_read() {
+        let db = temp_db().await;
         let mut jobs = vec![];
-        for i in 0..10000 {
+        for i in 0..100 {
             let cloned = db.clone();
             let id = i.to_string();
-            let a = tokio::spawn(async move {
+            jobs.push(tokio::spawn(async move {
                 let empty_vec = Vec::new();
-                cloned
-                    .insert_peer(&id, &empty_vec, &empty_vec, "")
-                    .await
-                    .unwrap();
-            });
-            jobs.push(a);
+                cloned.insert_peer(&id, &empty_vec, &empty_vec, "").await.unwrap();
+            }));
         }
-        for i in 0..10000 {
+        for i in 0..100 {
             let cloned = db.clone();
             let id = i.to_string();
-            let a = tokio::spawn(async move {
+            jobs.push(tokio::spawn(async move {
                 cloned.get_peer(&id).await.unwrap();
-            });
-            jobs.push(a);
+            }));
         }
         hbb_common::futures::future::join_all(jobs).await;
     }

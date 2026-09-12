@@ -168,3 +168,51 @@ fn main() {
         _ => print_help(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_keypair_valid() {
+        let (pk, sk) = sign::gen_keypair();
+        let pk_b64 = base64::encode(pk);
+        let sk_b64 = base64::encode(sk);
+        assert!(validate_keypair(&pk_b64, &sk_b64).is_ok());
+    }
+
+    #[test]
+    fn test_validate_keypair_invalid_secret_key() {
+        let (pk, _sk) = sign::gen_keypair();
+        let pk_b64 = base64::encode(pk);
+        let result = validate_keypair(&pk_b64, "not-valid-base64!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_keypair_mismatched_keys() {
+        let (pk1, _sk1) = sign::gen_keypair();
+        let (_pk2, sk2) = sign::gen_keypair();
+        let pk_b64 = base64::encode(pk1);
+        let sk_b64 = base64::encode(sk2);
+        let result = validate_keypair(&pk_b64, &sk_b64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_keypair_empty_secret() {
+        let (pk, _) = sign::gen_keypair();
+        let pk_b64 = base64::encode(pk);
+        let result = validate_keypair(&pk_b64, "");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_keypair_wrong_length_secret() {
+        let (pk, _) = sign::gen_keypair();
+        let pk_b64 = base64::encode(pk);
+        let short_sk = base64::encode(b"tooshort");
+        let result = validate_keypair(&pk_b64, &short_sk);
+        assert!(result.is_err());
+    }
+}

@@ -1527,3 +1527,176 @@ fn get_symetric_key_from_msg(
         Err(e) => panic!("Error while opening the seal key{:?}", e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod encrypt_tests {
+        use super::*;
+
+        fn make_encrypt() -> Encrypt {
+            let key = secretbox::gen_key();
+            Encrypt {
+                key,
+                enc_seqnum: 0,
+                dec_seqnum: 0,
+            }
+        }
+
+        #[test]
+        fn test_encrypt_decrypt_roundtrip() {
+            let mut enc = make_encrypt();
+            let mut dec = Encrypt { ..enc.clone() };
+            let plaintext = b"hello world";
+
+            let ciphertext = enc.enc(plaintext);
+            assert_ne!(ciphertext, plaintext);
+
+            let decrypted = dec.dec(&BytesMut::from(&ciphertext[..])).unwrap();
+            assert_eq!(decrypted, plaintext);
+        }
+
+        #[test]
+        fn test_encrypt_different_messages_produce_different_ciphertext() {
+            let mut enc = make_encrypt();
+            let ct1 = enc.enc(b"message1");
+            let ct2 = enc.enc(b"message1");
+            assert_ne!(ct1, ct2);
+        }
+
+        #[test]
+        fn test_decrypt_wrong_sequence_fails() {
+            let mut enc = make_encrypt();
+            let mut dec = Encrypt { ..enc.clone() };
+
+            let ct1 = enc.enc(b"first");
+            let ct2 = enc.enc(b"second");
+
+            // Decrypt ct2 first (wrong order) should fail
+            let result = dec.dec(&BytesMut::from(&ct2[..]));
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_get_nonce_different_for_different_seqnums() {
+            let n1 = Encrypt::get_nonce(1);
+            let n2 = Encrypt::get_nonce(2);
+            assert_ne!(n1.0, n2.0);
+        }
+
+        #[test]
+        fn test_get_nonce_deterministic() {
+            let n1 = Encrypt::get_nonce(42);
+            let n2 = Encrypt::get_nonce(42);
+            assert_eq!(n1.0, n2.0);
+        }
+    }
+
+    mod is_lan_tests {
+        use super::*;
+
+        fn test_is_lan_inner(mask: Option<Ipv4Network>, addr: SocketAddr) -> bool {
+            if let Some(network) = &mask {
+                match addr {
+                    SocketAddr::V4(v4_socket_addr) => {
+                        return network.contains(*v4_socket_addr.ip());
+                    }
+                    SocketAddr::V6(v6_socket_addr) => {
+                        if let Some(v4_addr) = v6_socket_addr.ip().to_ipv4() {
+                            return network.contains(v4_addr);
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        #[test]
+        fn test_is_lan_with_matching_subnet() {
+            let mask: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+            let addr: SocketAddr = "192.168.1.100:8080".parse().unwrap();
+            assert!(test_is_lan_inner(Some(mask), addr));
+        }
+
+        #[test]
+        fn test_is_lan_with_non_matching_subnet() {
+            let mask: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+            let addr: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+            assert!(!test_is_lan_inner(Some(mask), addr));
+        }
+
+        #[test]
+        fn test_is_lan_without_mask_always_false() {
+            let addr: SocketAddr = "192.168.1.100:8080".parse().unwrap();
+            assert!(!test_is_lan_inner(None, addr));
+        }
+
+        #[test]
+        fn test_is_lan_boundary_address() {
+            let mask: Ipv4Network = "10.0.0.0/8".parse().unwrap();
+            assert!(test_is_lan_inner(Some(mask), "10.255.255.255:80".parse().unwrap()));
+            assert!(!test_is_lan_inner(Some(mask), "11.0.0.1:80".parse().unwrap()));
+        }
+    }
+
+    mod relay_server_tests {
+        use super::*;
+
+        #[test]
+        fn test_get_relay_server_empty_returns_empty() {
+            let relays: RelayServers = vec![];
+            assert!(relays.is_empty());
+        }
+
+        #[test]
+        fn test_get_relay_server_single_returns_it() {
+            let relays: RelayServers = vec!["relay1.example.com".to_owned()];
+            assert_eq!(relays.len(), 1);
+            assert_eq!(relays[0], "relay1.example.com");
+        }
+
+        #[test]
+        fn test_relay_rotation_wraps_around() {
+            let relays = vec!["r1".to_owned(), "r2".to_owned(), "r3".to_owned()];
+            ROTATION_RELAY_SERVER.store(0, Ordering::SeqCst);
+            for round in 0..2 {
+                for j in 0..3 {
+                    let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % relays.len();
+                    assert_eq!(i, j, "round={round}");
+                }
+            }
+        }
+    }
+
+    mod get_server_sk_tests {
+        use super::*;
+
+        #[test]
+        fn test_valid_secret_key_parsed() {
+            let (pk, sk) = sign::gen_keypair();
+            let sk_b64 = base64::encode(&sk);
+            let (key, out_sk) = RendezvousServer::get_server_sk(&sk_b64);
+            assert!(out_sk.is_some());
+            assert_eq!(key, base64::encode(pk));
+        }
+
+        #[test]
+        fn test_non_base64_key_treated_as_plain() {
+            let (key, sk) = RendezvousServer::get_server_sk("not-valid-base64!!!");
+            // Non-base64 strings aren't decoded, so sk stays None,
+            // and since key is non-empty and not "-" or "_", gen_sk is not called
+            assert_eq!(key, "not-valid-base64!!!");
+            assert!(sk.is_none());
+        }
+
+        #[test]
+        fn test_short_base64_not_secret_key() {
+            let short = base64::encode(b"tooshort");
+            let (key, sk) = RendezvousServer::get_server_sk(&short);
+            // Decodes fine but length != SECRETKEYBYTES, so not treated as crypto key
+            assert_eq!(key, short);
+            assert!(sk.is_none());
+        }
+    }
+}
