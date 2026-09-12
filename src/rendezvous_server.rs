@@ -1638,6 +1638,28 @@ mod tests {
             assert!(test_is_lan_inner(Some(mask), "10.255.255.255:80".parse().unwrap()));
             assert!(!test_is_lan_inner(Some(mask), "11.0.0.1:80".parse().unwrap()));
         }
+
+        #[test]
+        fn test_is_lan_ipv6_mapped_v4() {
+            let mask: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+            // IPv6-mapped IPv4 address ::ffff:192.168.1.5
+            let addr: SocketAddr = "[::ffff:192.168.1.5]:8080".parse().unwrap();
+            assert!(test_is_lan_inner(Some(mask), addr));
+        }
+
+        #[test]
+        fn test_is_lan_ipv6_mapped_v4_non_matching() {
+            let mask: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+            let addr: SocketAddr = "[::ffff:10.0.0.1]:8080".parse().unwrap();
+            assert!(!test_is_lan_inner(Some(mask), addr));
+        }
+
+        #[test]
+        fn test_is_lan_pure_ipv6() {
+            let mask: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+            let addr: SocketAddr = "[::1]:8080".parse().unwrap();
+            assert!(!test_is_lan_inner(Some(mask), addr));
+        }
     }
 
     mod relay_server_tests {
@@ -1802,6 +1824,114 @@ mod tests {
             };
             let result = rs.handle_register_pk(rk, addr).await;
             assert_eq!(result, Err(UUID_MISMATCH));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_ip_pk_mismatch_rejected() {
+            IP_BLOCKER.lock().await.clear();
+            let (mut rs, _rx) = test_server().await;
+            let addr1: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let addr2: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+
+            // First registration
+            let rk = RegisterPk {
+                id: "peer_ipm".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            rs.handle_register_pk(rk, addr1).await.unwrap();
+
+            // Same uuid, different IP AND different PK
+            let rk = RegisterPk {
+                id: "peer_ipm".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![3; 32].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, addr2).await;
+            assert_eq!(result, Err(UUID_MISMATCH));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_ip_change_tracked() {
+            IP_BLOCKER.lock().await.clear();
+            IP_CHANGES.lock().await.clear();
+            let (mut rs, _rx) = test_server().await;
+            let addr1: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let addr2: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+
+            // First registration from IP1
+            let rk = RegisterPk {
+                id: "peer_ipc".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            rs.handle_register_pk(rk, addr1).await.unwrap();
+
+            // Same uuid, same pk, different IP
+            let rk = RegisterPk {
+                id: "peer_ipc".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, addr2).await;
+            assert_eq!(result, Ok(register_pk_response::Result::OK));
+
+            // Check IP change was tracked
+            let lock = IP_CHANGES.lock().await;
+            assert!(lock.contains_key("peer_ipc"));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_rate_limited() {
+            IP_BLOCKER.lock().await.clear();
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "10.0.0.3:1234".parse().unwrap();
+
+            // Register 4 times rapidly — 4th should be rate limited
+            for i in 0..4 {
+                let rk = RegisterPk {
+                    id: "peer_rl".to_owned(),
+                    uuid: vec![1; 16].into(),
+                    pk: vec![2; 32].into(),
+                    ..Default::default()
+                };
+                let result = rs.handle_register_pk(rk, addr).await;
+                if i < 3 {
+                    assert_eq!(result, Ok(register_pk_response::Result::OK), "failed at iteration {}", i);
+                } else {
+                    assert_eq!(result, Err(TOO_FREQUENT), "should be rate limited at iteration {}", i);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_no_change_no_update() {
+            IP_BLOCKER.lock().await.clear();
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "10.0.0.4:1234".parse().unwrap();
+
+            // First registration
+            let rk = RegisterPk {
+                id: "peer_nc".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            rs.handle_register_pk(rk, addr).await.unwrap();
+
+            // Same everything — no change needed
+            let rk = RegisterPk {
+                id: "peer_nc".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, addr).await;
+            assert_eq!(result, Ok(register_pk_response::Result::OK));
         }
     }
 

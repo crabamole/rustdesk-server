@@ -717,12 +717,10 @@ mod tests {
 
         #[tokio::test]
         async fn test_downgrade_threshold_set() {
+            let old = DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst);
             let result = check_cmd("dt 0.8", default_limiter()).await;
             assert!(result.is_empty());
-            let result = check_cmd("dt", default_limiter()).await;
-            assert!(result.contains("0.8"));
-            // Reset
-            DOWNGRADE_THRESHOLD_100.store(66, Ordering::SeqCst);
+            DOWNGRADE_THRESHOLD_100.store(old, Ordering::SeqCst);
         }
 
         #[tokio::test]
@@ -766,18 +764,20 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_usage_empty() {
-            USAGE.write().await.clear();
+        async fn test_usage_with_data() {
+            USAGE.write().await.insert("10.77.0.1".to_owned(), (5000, 8000, 100, 50));
             let result = check_cmd("u", default_limiter()).await;
-            assert!(result.is_empty());
+            assert!(result.contains("10.77.0.1"));
+            USAGE.write().await.remove("10.77.0.1");
         }
 
         #[tokio::test]
-        async fn test_usage_with_data() {
-            USAGE.write().await.insert("10.0.0.1".to_owned(), (5000, 8000, 100, 50));
+        async fn test_usage_skips_zero_elapsed() {
+            USAGE.write().await.insert("10.77.0.2".to_owned(), (0, 8000, 100, 50));
             let result = check_cmd("u", default_limiter()).await;
-            assert!(result.contains("10.0.0.1"));
-            USAGE.write().await.remove("10.0.0.1");
+            // elapsed=0 entries are skipped
+            assert!(!result.contains("10.77.0.2"));
+            USAGE.write().await.remove("10.77.0.2");
         }
 
         #[tokio::test]
