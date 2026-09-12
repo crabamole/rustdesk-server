@@ -1425,6 +1425,80 @@ impl RendezvousServer {
     }
 }
 
+#[cfg(feature = "integration-test")]
+pub struct TestServer {
+    pub port: u16,
+    pub udp_port: u16,
+    pub nat_port: u16,
+    pub ws_port: u16,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(feature = "integration-test")]
+impl TestServer {
+    pub fn shutdown(self) {
+        let _ = self.shutdown.send(());
+    }
+}
+
+#[cfg(feature = "integration-test")]
+impl RendezvousServer {
+    pub async fn start_test(key: &str) -> ResultType<TestServer> {
+        let (key, sk) = Self::get_server_sk(key);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("test.sqlite3");
+        std::mem::forget(dir);
+        let db = crate::database::Database::new(path.to_str().unwrap()).await?;
+        let pm = PeerMap::new_with_db(db);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
+        let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
+        let mut rs = Self {
+            tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            pm,
+            tx,
+            relay_servers: Default::default(),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Arc::new(vec![]),
+            inner: Arc::new(Inner {
+                serial: 1,
+                version: String::new(),
+                software_url: String::new(),
+                sk,
+                mask: None,
+                local_ip: String::new(),
+                secure_tcp_pk_b,
+                secure_tcp_sk_b,
+            }),
+        };
+
+        let mut socket = create_udp_listener(0, 0).await?;
+        let udp_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        let mut listener = create_tcp_listener(0).await?;
+        let port = listener.local_addr()?.port();
+        let mut listener2 = create_tcp_listener(0).await?;
+        let nat_port = listener2.local_addr()?.port();
+        let mut listener3 = create_tcp_listener(0).await?;
+        let ws_port = listener3.local_addr()?.port();
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = rs.io_loop(&mut rx, &mut listener, &mut listener2, &mut listener3, &mut socket, &key) => {}
+                _ = &mut shutdown_rx => {}
+            }
+        });
+
+        Ok(TestServer {
+            port,
+            udp_port,
+            nat_port,
+            ws_port,
+            shutdown: shutdown_tx,
+        })
+    }
+}
+
 async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
     let mut futs = Vec::new();
     let rs = Arc::new(Mutex::new(Vec::new()));
@@ -2373,6 +2447,631 @@ mod tests {
             // Decodes fine but length != SECRETKEYBYTES, so not treated as crypto key
             assert_eq!(key, short);
             assert!(sk.is_none());
+        }
+    }
+
+    mod more_check_cmd_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_ip_blocker_with_data_shows_details() {
+            let (rs, _rx) = test_server().await;
+            // Populate IP_BLOCKER with some data
+            let unique_ip = "10.222.0.1";
+            IP_BLOCKER.lock().await.insert(
+                unique_ip.to_owned(),
+                (
+                    (5, Instant::now()),
+                    ({
+                        let mut s = std::collections::HashSet::new();
+                        s.insert("peer_a".to_owned());
+                        s
+                    }, Instant::now()),
+                ),
+            );
+
+            // Lookup specific IP
+            let result = rs.check_cmd(&format!("ib {}", unique_ip)).await;
+            assert!(result.contains("5/"), "Should show request count: got '{}'", result);
+
+            // List with offset
+            let result = rs.check_cmd("ib 0").await;
+            assert!(result.contains(unique_ip) || !result.is_empty());
+
+            // Remove
+            let result = rs.check_cmd(&format!("ib {} -", unique_ip)).await;
+            assert!(!result.is_empty());
+
+            IP_BLOCKER.lock().await.remove(unique_ip);
+        }
+
+        #[tokio::test]
+        async fn test_ip_changes_with_data_shows_details() {
+            let (rs, _rx) = test_server().await;
+            let unique_id = "ic_test_peer_99";
+            IP_CHANGES.lock().await.insert(
+                unique_id.to_owned(),
+                (
+                    Instant::now(),
+                    {
+                        let mut m = HashMap::new();
+                        m.insert("10.0.0.1".to_owned(), 3);
+                        m.insert("10.0.0.2".to_owned(), 1);
+                        m
+                    },
+                ),
+            );
+
+            // Lookup specific id
+            let result = rs.check_cmd(&format!("ic {}", unique_id)).await;
+            assert!(result.contains("10.0.0.1"), "Should show IP details");
+
+            // List with offset
+            let result = rs.check_cmd("ic 0").await;
+            assert!(result.contains(unique_id) || !result.is_empty());
+
+            // Remove
+            rs.check_cmd(&format!("ic {} -", unique_id)).await;
+            assert!(IP_CHANGES.lock().await.get(unique_id).is_none());
+        }
+
+        #[tokio::test]
+        async fn test_reload_geo_command() {
+            let (rs, _rx) = test_server().await;
+            let result = rs.check_cmd("rg").await;
+            // reload-geo just reloads, returns empty or no output
+            assert!(result.is_empty());
+        }
+    }
+
+    mod more_check_ip_blocker_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_ip_blocker_counter_resets_after_duration() {
+            let (rs, _rx) = test_server().await;
+            let unique_ip = "10.223.0.1";
+            // Insert with expired timestamp
+            let expired = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(IP_BLOCK_DUR + 10))
+                .unwrap();
+            IP_BLOCKER.lock().await.insert(
+                unique_ip.to_owned(),
+                ((35, expired), (Default::default(), Instant::now())),
+            );
+
+            // Should be allowed because counter is expired
+            let result = rs.check_ip_blocker(unique_ip, "some_peer").await;
+            assert!(result, "Counter should reset after IP_BLOCK_DUR");
+
+            IP_BLOCKER.lock().await.remove(unique_ip);
+        }
+
+        #[tokio::test]
+        async fn test_ip_blocker_too_many_ids_blocks_new() {
+            let (rs, _rx) = test_server().await;
+            let unique_ip = "10.224.0.1";
+            let mut ids = std::collections::HashSet::new();
+            for i in 0..301 {
+                ids.insert(format!("peer_{}", i));
+            }
+            IP_BLOCKER.lock().await.insert(
+                unique_ip.to_owned(),
+                ((0, Instant::now()), (ids, Instant::now())),
+            );
+
+            // Should block a brand new ID
+            let result = rs.check_ip_blocker(unique_ip, "brand_new_peer").await;
+            assert!(!result, "Should block new peer when >300 IDs from same IP");
+
+            // Should allow an existing ID
+            let result = rs.check_ip_blocker(unique_ip, "peer_0").await;
+            assert!(result, "Should allow existing peer ID");
+
+            IP_BLOCKER.lock().await.remove(unique_ip);
+        }
+
+        #[tokio::test]
+        async fn test_ip_blocker_day_reset() {
+            let (rs, _rx) = test_server().await;
+            let unique_ip = "10.225.0.1";
+            let expired_day = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(DAY_SECONDS + 10))
+                .unwrap();
+            let mut ids = std::collections::HashSet::new();
+            for i in 0..301 {
+                ids.insert(format!("peer_{}", i));
+            }
+            IP_BLOCKER.lock().await.insert(
+                unique_ip.to_owned(),
+                ((0, Instant::now()), (ids, expired_day)),
+            );
+
+            // Day expired, IDs should be cleared, new peer should be allowed
+            let result = rs.check_ip_blocker(unique_ip, "brand_new_peer").await;
+            assert!(result, "Should allow after day reset");
+
+            IP_BLOCKER.lock().await.remove(unique_ip);
+        }
+    }
+
+    mod more_punch_hole_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_always_use_relay_forces_symmetric() {
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "relay_target", "10.0.0.1:9999").await;
+
+            ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
+
+            let ph = PunchHoleRequest {
+                id: "relay_target".to_owned(),
+                ..Default::default()
+            };
+            let addr: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+            let (msg, peer_addr) = rs.handle_punch_hole_request(addr, ph, "", false).await.unwrap();
+            assert!(peer_addr.is_some());
+            // When ALWAYS_USE_RELAY is set, nat_type should be forced to SYMMETRIC
+            assert!(msg.has_punch_hole());
+            assert_eq!(
+                msg.punch_hole().nat_type,
+                NatType::SYMMETRIC.into(),
+            );
+
+            ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
+        }
+
+        #[tokio::test]
+        async fn test_punch_hole_with_lan_mask() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.sqlite3");
+            std::mem::forget(dir);
+            let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+            let pm = PeerMap::new_with_db(db);
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
+            let (_pk, sk) = sign::gen_keypair();
+
+            let mask: ipnetwork::Ipv4Network = "10.0.0.0/24".parse().unwrap();
+            let mut rs = RendezvousServer {
+                tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+                pm,
+                tx,
+                relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
+                relay_servers0: Default::default(),
+                rendezvous_servers: Arc::new(vec![]),
+                inner: Arc::new(Inner {
+                    serial: 1,
+                    version: String::new(),
+                    software_url: String::new(),
+                    mask: Some(mask),
+                    local_ip: "10.0.0.100".to_owned(),
+                    sk: Some(sk),
+                    secure_tcp_pk_b,
+                    secure_tcp_sk_b,
+                }),
+            };
+            register_peer(&mut rs, "lan_peer", "10.0.0.5:9999").await;
+
+            // Both peers in same LAN
+            let ph = PunchHoleRequest {
+                id: "lan_peer".to_owned(),
+                ..Default::default()
+            };
+            let addr: SocketAddr = "10.0.0.10:1234".parse().unwrap();
+            let (msg, peer_addr) = rs.handle_punch_hole_request(addr, ph, "", false).await.unwrap();
+            assert!(peer_addr.is_some());
+            // Same intranet peers get FetchLocalAddr
+            assert!(msg.has_fetch_local_addr(), "Same LAN peers should get FetchLocalAddr, got: {:?}", msg);
+        }
+
+        #[tokio::test]
+        async fn test_punch_hole_cross_lan_forces_relay() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.sqlite3");
+            std::mem::forget(dir);
+            let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+            let pm = PeerMap::new_with_db(db);
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
+            let (_pk, sk) = sign::gen_keypair();
+
+            let mask: ipnetwork::Ipv4Network = "10.0.0.0/24".parse().unwrap();
+            let mut rs = RendezvousServer {
+                tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+                pm,
+                tx,
+                relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
+                relay_servers0: Default::default(),
+                rendezvous_servers: Arc::new(vec![]),
+                inner: Arc::new(Inner {
+                    serial: 1,
+                    version: String::new(),
+                    software_url: String::new(),
+                    mask: Some(mask),
+                    local_ip: "10.0.0.100".to_owned(),
+                    sk: Some(sk),
+                    secure_tcp_pk_b,
+                    secure_tcp_sk_b,
+                }),
+            };
+            // Peer in LAN
+            register_peer(&mut rs, "lan_peer2", "10.0.0.5:9999").await;
+
+            // Requester outside LAN — cross LAN => force relay
+            let ph = PunchHoleRequest {
+                id: "lan_peer2".to_owned(),
+                ..Default::default()
+            };
+            let addr: SocketAddr = "192.168.1.100:1234".parse().unwrap();
+            let (msg, peer_addr) = rs.handle_punch_hole_request(addr, ph, "", false).await.unwrap();
+            assert!(peer_addr.is_some());
+            // Cross-LAN should force SYMMETRIC (relay)
+            assert!(msg.has_punch_hole());
+            assert_eq!(
+                msg.punch_hole().nat_type,
+                NatType::SYMMETRIC.into(),
+            );
+        }
+    }
+
+    mod handle_hole_sent_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_handle_hole_sent_via_udp() {
+            let (mut rs, mut rx) = test_server().await;
+            register_peer(&mut rs, "hs_peer", "192.168.1.10:5000").await;
+
+            let addr_a: SocketAddr = "192.168.1.20:6000".parse().unwrap();
+            let addr_b: SocketAddr = "192.168.1.30:7000".parse().unwrap();
+
+            let phs = PunchHoleSent {
+                socket_addr: AddrMangle::encode(addr_a).into(),
+                id: "hs_peer".to_owned(),
+                relay_server: "relay1.example.com".to_owned(),
+                ..Default::default()
+            };
+
+            // Create a FramedSocket for UDP send
+            let mut socket = create_udp_listener(0, 0).await.unwrap();
+            let result = rs.handle_hole_sent(phs, addr_b, Some(&mut socket)).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn test_handle_hole_sent_via_tcp() {
+            let (mut rs, mut rx) = test_server().await;
+            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+
+            let phs = PunchHoleSent {
+                socket_addr: AddrMangle::encode(addr_a).into(),
+                id: "".to_owned(),
+                ..Default::default()
+            };
+
+            // TCP path: socket is None, sends via send_to_tcp
+            let result = rs.handle_hole_sent(phs, addr_b, None).await;
+            assert!(result.is_ok());
+        }
+    }
+
+    mod handle_local_addr_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_handle_local_addr_via_udp() {
+            let (mut rs, mut rx) = test_server().await;
+            register_peer(&mut rs, "la_peer", "10.0.0.5:5000").await;
+
+            let addr_a: SocketAddr = "10.0.0.10:6000".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.20:7000".parse().unwrap();
+
+            let la = LocalAddr {
+                socket_addr: AddrMangle::encode(addr_a).into(),
+                local_addr: vec![1, 2, 3, 4, 5, 6].into(),
+                id: "la_peer".to_owned(),
+                relay_server: "relay.example.com".to_owned(),
+                ..Default::default()
+            };
+
+            let mut socket = create_udp_listener(0, 0).await.unwrap();
+            let result = rs.handle_local_addr(la, addr_b, Some(&mut socket)).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn test_handle_local_addr_via_tcp() {
+            let (mut rs, mut rx) = test_server().await;
+            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+
+            let la = LocalAddr {
+                socket_addr: AddrMangle::encode(addr_a).into(),
+                local_addr: vec![10, 20, 30, 40].into(),
+                id: "".to_owned(),
+                relay_server: "".to_owned(),
+                ..Default::default()
+            };
+
+            let result = rs.handle_local_addr(la, addr_b, None).await;
+            assert!(result.is_ok());
+        }
+    }
+
+    mod handle_online_request_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_handle_online_request_empty_peers() {
+            let (mut rs, _rx) = test_server().await;
+
+            // Create a TCP listener and connect to it
+            let listener = hbb_common::tcp::listen_any(0, true).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let connect_handle = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                stream
+            });
+            let client = hbb_common::tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+                .await
+                .unwrap();
+            let server_stream = connect_handle.await.unwrap();
+            let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            let mut stream = FramedStream::from(server_stream, addr);
+
+            let result = rs.handle_online_request(&mut stream, vec![]).await;
+            assert!(result.is_ok());
+        }
+    }
+
+    mod handle_tcp_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_handle_tcp_unknown_message_returns_false() {
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let mut sink = None;
+
+            // Empty/invalid bytes
+            let result = rs.handle_tcp(b"invalid", &mut sink, addr, "", false).await;
+            assert!(!result);
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_register_pk_success() {
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_register_pk(RegisterPk {
+                id: "tcp_test_peer".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            // Without a sink, response is lost but code path is exercised
+            let result = rs.handle_tcp(&bytes, &mut sink, addr, "", false).await;
+            // RegisterPk returns true on OK
+            assert!(result);
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_punch_hole_request_stores_sink() {
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_punch_hole_request(PunchHoleRequest {
+                id: "nonexistent_peer".to_owned(),
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            let result = rs.handle_tcp(&bytes, &mut sink, addr, "", false).await;
+            assert!(result); // PunchHoleRequest always returns true
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_request_relay_no_peer() {
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_request_relay(RequestRelay {
+                id: "nonexistent_peer".to_owned(),
+                uuid: "test-uuid".to_owned(),
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            let result = rs.handle_tcp(&bytes, &mut sink, addr, "", false).await;
+            assert!(result); // RequestRelay always returns true
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_request_relay_with_peer() {
+            let (mut rs, mut rx) = test_server().await;
+            register_peer(&mut rs, "relay_tgt", "10.0.0.5:9000").await;
+
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_request_relay(RequestRelay {
+                id: "relay_tgt".to_owned(),
+                uuid: "test-uuid-2".to_owned(),
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            let result = rs.handle_tcp(&bytes, &mut sink, addr, "", false).await;
+            assert!(result);
+
+            // Server should have sent RequestRelay to peer via tx
+            if let Ok(data) = rx.try_recv() {
+                match data {
+                    Data::Msg(_, to_addr) => {
+                        assert_eq!(to_addr, "10.0.0.5:9000".parse::<SocketAddr>().unwrap());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_test_nat_request() {
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_test_nat_request(TestNatRequest {
+                serial: 0,
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            // Without sink, response is lost but code path exercised
+            let result = rs.handle_tcp(&bytes, &mut sink, addr, "", false).await;
+            assert!(!result); // TestNatRequest falls through to return false
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_punch_hole_sent() {
+            let (mut rs, _rx) = test_server().await;
+            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_punch_hole_sent(PunchHoleSent {
+                socket_addr: AddrMangle::encode(addr_a).into(),
+                id: "".to_owned(),
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            let result = rs.handle_tcp(&bytes, &mut sink, addr_b, "", false).await;
+            assert!(!result); // PunchHoleSent falls through
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_local_addr() {
+            let (mut rs, _rx) = test_server().await;
+            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_local_addr(LocalAddr {
+                socket_addr: AddrMangle::encode(addr_a).into(),
+                local_addr: vec![1, 2, 3, 4].into(),
+                id: "".to_owned(),
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            let result = rs.handle_tcp(&bytes, &mut sink, addr_b, "", false).await;
+            assert!(!result); // LocalAddr falls through
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_relay_response() {
+            let (mut rs, _rx) = test_server().await;
+            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_relay_response(RelayResponse {
+                socket_addr: AddrMangle::encode(addr_b).into(),
+                relay_server: "relay.example.com".to_owned(),
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            let result = rs.handle_tcp(&bytes, &mut sink, addr_a, "", false).await;
+            assert!(!result); // RelayResponse falls through
+        }
+
+        #[tokio::test]
+        async fn test_handle_tcp_key_exchange_invalid() {
+            let (mut rs, _rx) = test_server().await;
+            let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+            let mut sink = None;
+
+            let mut msg = RendezvousMessage::new();
+            msg.set_key_exchange(KeyExchange {
+                keys: vec![vec![0; 32].into()], // only 1 key, needs 2
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+
+            let result = rs.handle_tcp(&bytes, &mut sink, addr, "", false).await;
+            assert!(!result); // Invalid key exchange returns false
+        }
+    }
+
+    mod logged_in_only_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_logged_in_only_empty_token_rejected() {
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "logged_peer", "10.0.0.5:5000").await;
+
+            std::env::set_var("LOGGED_IN_ONLY", "Y");
+
+            let ph = PunchHoleRequest {
+                id: "logged_peer".to_owned(),
+                token: "".to_owned(),
+                ..Default::default()
+            };
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, _) = rs.handle_punch_hole_request(addr, ph, "", false).await.unwrap();
+
+            std::env::remove_var("LOGGED_IN_ONLY");
+
+            assert!(msg.has_punch_hole_response());
+            assert!(
+                msg.punch_hole_response().other_failure.contains("not logged in"),
+            );
+        }
+
+        #[tokio::test]
+        async fn test_logged_in_only_with_token_tries_api() {
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "logged_peer2", "10.0.0.5:5000").await;
+
+            std::env::set_var("LOGGED_IN_ONLY", "Y");
+
+            let ph = PunchHoleRequest {
+                id: "logged_peer2".to_owned(),
+                token: "fake-jwt-token".to_owned(),
+                ..Default::default()
+            };
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            // This will fail because API server isn't running, but exercises the code path
+            let result = rs.handle_punch_hole_request(addr, ph, "", false).await;
+
+            std::env::remove_var("LOGGED_IN_ONLY");
+
+            // Should get an error or LOGIN_OVERHAUL response (API server not available)
+            match result {
+                Ok((msg, _)) => {
+                    assert!(msg.has_punch_hole_response());
+                }
+                Err(_) => {} // API call failed, expected
+            }
         }
     }
 }

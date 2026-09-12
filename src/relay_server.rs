@@ -634,6 +634,44 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     fn set_raw(&mut self) {}
 }
 
+#[cfg(feature = "integration-test")]
+pub struct TestRelayServer {
+    pub port: u16,
+    pub ws_port: u16,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(feature = "integration-test")]
+impl TestRelayServer {
+    pub fn shutdown(self) {
+        let _ = self.shutdown.send(());
+    }
+
+    pub async fn start(key: &str) -> hbb_common::ResultType<Self> {
+        let key = get_server_sk(key);
+        let listener = hbb_common::tcp::listen_any(0, true).await?;
+        let port = listener.local_addr()?.port();
+        let listener2 = hbb_common::tcp::listen_any(0, true).await?;
+        let ws_port = listener2.local_addr()?.port();
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let key = key.to_owned();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = io_loop(listener, listener2, &key) => {}
+                _ = &mut shutdown_rx => {}
+            }
+        });
+
+        Ok(TestRelayServer {
+            port,
+            ws_port,
+            shutdown: shutdown_tx,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,5 +855,107 @@ mod tests {
         // check_params reads env vars and sets atomics
         // Just verify it doesn't panic with default env
         check_params();
+    }
+
+    #[test]
+    fn test_check_params_with_env_vars() {
+        let old_dt = DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst);
+        let old_dsc = DOWNGRADE_START_CHECK.load(Ordering::SeqCst);
+        let old_ls = LIMIT_SPEED.load(Ordering::SeqCst);
+        let old_tb = TOTAL_BANDWIDTH.load(Ordering::SeqCst);
+        let old_sb = SINGLE_BANDWIDTH.load(Ordering::SeqCst);
+
+        std::env::set_var("DOWNGRADE_THRESHOLD", "0.75");
+        std::env::set_var("DOWNGRADE_START_CHECK", "2400");
+        std::env::set_var("LIMIT_SPEED", "8.0");
+        std::env::set_var("TOTAL_BANDWIDTH", "512.0");
+        std::env::set_var("SINGLE_BANDWIDTH", "32.0");
+
+        check_params();
+
+        assert_eq!(DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst), 75);
+        assert_eq!(DOWNGRADE_START_CHECK.load(Ordering::SeqCst), 2_400_000);
+        assert_eq!(LIMIT_SPEED.load(Ordering::SeqCst), (8.0 * 1024. * 1024.) as usize);
+        assert_eq!(TOTAL_BANDWIDTH.load(Ordering::SeqCst), (512.0 * 1024. * 1024.) as usize);
+        assert_eq!(SINGLE_BANDWIDTH.load(Ordering::SeqCst), (32.0 * 1024. * 1024.) as usize);
+
+        // Restore
+        DOWNGRADE_THRESHOLD_100.store(old_dt, Ordering::SeqCst);
+        DOWNGRADE_START_CHECK.store(old_dsc, Ordering::SeqCst);
+        LIMIT_SPEED.store(old_ls, Ordering::SeqCst);
+        TOTAL_BANDWIDTH.store(old_tb, Ordering::SeqCst);
+        SINGLE_BANDWIDTH.store(old_sb, Ordering::SeqCst);
+
+        std::env::remove_var("DOWNGRADE_THRESHOLD");
+        std::env::remove_var("DOWNGRADE_START_CHECK");
+        std::env::remove_var("LIMIT_SPEED");
+        std::env::remove_var("TOTAL_BANDWIDTH");
+        std::env::remove_var("SINGLE_BANDWIDTH");
+    }
+
+    mod check_cmd_extra_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_blacklist_add_multiple_pipe() {
+            check_cmd("ba 10.195.0.1|10.195.0.2|10.195.0.3", default_limiter()).await;
+            let r1 = check_cmd("b 10.195.0.1", default_limiter()).await;
+            let r2 = check_cmd("b 10.195.0.2", default_limiter()).await;
+            let r3 = check_cmd("b 10.195.0.3", default_limiter()).await;
+            assert!(r1.contains("true"));
+            assert!(r2.contains("true"));
+            assert!(r3.contains("true"));
+            check_cmd("br 10.195.0.1|10.195.0.2|10.195.0.3", default_limiter()).await;
+        }
+
+        #[tokio::test]
+        async fn test_total_bandwidth_set() {
+            let old = TOTAL_BANDWIDTH.load(Ordering::SeqCst);
+            check_cmd("tb 256.0", default_limiter()).await;
+            assert_eq!(TOTAL_BANDWIDTH.load(Ordering::SeqCst), (256.0 * 1024. * 1024.) as usize);
+            TOTAL_BANDWIDTH.store(old, Ordering::SeqCst);
+        }
+
+        #[tokio::test]
+        async fn test_single_bandwidth_set() {
+            let old = SINGLE_BANDWIDTH.load(Ordering::SeqCst);
+            check_cmd("sb 64.0", default_limiter()).await;
+            assert_eq!(SINGLE_BANDWIDTH.load(Ordering::SeqCst), (64.0 * 1024. * 1024.) as usize);
+            SINGLE_BANDWIDTH.store(old, Ordering::SeqCst);
+        }
+
+        #[tokio::test]
+        async fn test_blocklist_add_multiple_pipe() {
+            check_cmd("Ba 10.194.0.1|10.194.0.2", default_limiter()).await;
+            let r1 = check_cmd("B 10.194.0.1", default_limiter()).await;
+            let r2 = check_cmd("B 10.194.0.2", default_limiter()).await;
+            assert!(r1.contains("true"));
+            assert!(r2.contains("true"));
+            check_cmd("Br 10.194.0.1|10.194.0.2", default_limiter()).await;
+        }
+
+        #[tokio::test]
+        async fn test_blocklist_remove_multiple_pipe() {
+            check_cmd("Ba 10.193.0.1|10.193.0.2", default_limiter()).await;
+            check_cmd("Br 10.193.0.1|10.193.0.2", default_limiter()).await;
+            let r1 = check_cmd("B 10.193.0.1", default_limiter()).await;
+            assert!(r1.contains("false"));
+        }
+
+        #[tokio::test]
+        async fn test_blacklist_remove_multiple_pipe() {
+            check_cmd("ba 10.192.0.1|10.192.0.2", default_limiter()).await;
+            check_cmd("br 10.192.0.1|10.192.0.2", default_limiter()).await;
+            let r1 = check_cmd("b 10.192.0.1", default_limiter()).await;
+            assert!(r1.contains("false"));
+        }
+
+        #[tokio::test]
+        async fn test_limit_speed_set_specific() {
+            let old = LIMIT_SPEED.load(Ordering::SeqCst);
+            check_cmd("ls 2.5", default_limiter()).await;
+            assert_eq!(LIMIT_SPEED.load(Ordering::SeqCst), (2.5 * 1024. * 1024.) as usize);
+            LIMIT_SPEED.store(old, Ordering::SeqCst);
+        }
     }
 }

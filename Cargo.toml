@@ -66,6 +66,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json","rust
 [dev-dependencies]
 tempfile = "3"
 
+[features]
+integration-test = ["tempfile"]
+
+[dependencies.tempfile]
+version = "3"
+optional = true
+
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
 

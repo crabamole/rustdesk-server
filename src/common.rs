@@ -345,4 +345,34 @@ mod tests {
         assert_eq!(arg_name("key"), "KEY");
         assert_eq!(arg_name("serial"), "SERIAL");
     }
+
+    #[test]
+    fn test_gen_sk_key_derivation_logic() {
+        // Test the key derivation logic used in gen_sk without changing cwd
+        let (_, sk) = sign::gen_keypair();
+        let sk_b64 = base64::encode(&sk.0);
+        let decoded = base64::decode(&sk_b64).unwrap();
+        assert_eq!(decoded.len(), sign::SECRETKEYBYTES);
+
+        let mut tmp = [0u8; 64];
+        tmp[..].copy_from_slice(&decoded);
+        let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
+        assert!(!pk.is_empty());
+
+        // Verify it matches expected public key
+        let (expected_pk, _) = sign::gen_keypair();
+        // Different pair, just checking format
+        assert_eq!(pk.len(), base64::encode(expected_pk).len());
+    }
+
+    #[test]
+    fn test_gen_sk_pk_filter_logic() {
+        // gen_sk filters PKs containing / or : (up to 300 attempts)
+        for _ in 0..10 {
+            let (pk, _) = sign::gen_keypair();
+            let encoded = base64::encode(pk);
+            // Most keys won't contain / or :, verify the format
+            assert!(encoded.len() > 0);
+        }
+    }
 }

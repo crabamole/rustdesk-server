@@ -178,8 +178,7 @@ impl PeerMap {
         self.map.read().await.contains_key(id)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_db(db: database::Database) -> Self {
+    pub fn new_with_db(db: database::Database) -> Self {
         PeerMap {
             map: Default::default(),
             db,
