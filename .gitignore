@@ -1,6 +1,9 @@
 target
 id*
 db*
+!db_v2/
+!db_v2/create/
+!db_v2/create/*.sql
 debian-build
 debian/.debhelper
 debian/debhelper-build-stamp

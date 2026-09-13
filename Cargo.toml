@@ -32,12 +32,13 @@ base64 = "0.22"
 axum = { version = "0.5", features = ["headers"] }
 sqlx = { version = "0.8", features = [
     "runtime-tokio-rustls",
+    "any",
     "sqlite",
+    "postgres",
     "macros",
     "chrono",
     "json",
 ] }
-deadpool = "0.12"
 async-trait = "0.1"
 async-speed-limit = { git = "https://github.com/open-trade/async-speed-limit" }
 uuid = { version = "1.0", features = ["v4"] }
@@ -65,9 +66,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json","rust
 
 [dev-dependencies]
 tempfile = "3"
+paste = "1"
 
 [features]
 integration-test = ["tempfile"]
+postgres-tests = []
 
 [dependencies.tempfile]
 version = "3"

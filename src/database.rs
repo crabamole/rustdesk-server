@@ -1,37 +1,22 @@
-use hbb_common::{log, toml::de, ResultType};
+use hbb_common::{log, ResultType};
 use sqlx::{
-    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+    any::{install_default_drivers, AnyPoolOptions, AnyRow},
+    AnyPool, Row,
 };
-use std::{ops::DerefMut, str::FromStr};
-//use sqlx::postgres::PgPoolOptions;
-//use sqlx::mysql::MySqlPoolOptions;
 
-type Pool = deadpool::managed::Pool<DbPool>;
+const SCHEMA_SQLITE: &str = include_str!("../db_v2/create/db_sqlite.sql");
+const SCHEMA_POSTGRES: &str = include_str!("../db_v2/create/db_postgres.sql");
 
-pub struct DbPool {
-    url: String,
-}
-
-impl deadpool::managed::Manager for DbPool {
-    type Type = SqliteConnection;
-    type Error = SqlxError;
-    async fn create(&self) -> Result<SqliteConnection, SqlxError> {
-        let opt = SqliteConnectOptions::from_str(&self.url).unwrap();
-        let opt = opt.log_statements(log::LevelFilter::Debug);
-        SqliteConnection::connect_with(&opt).await
-    }
-    async fn recycle(
-        &self,
-        obj: &mut SqliteConnection,
-        _:&deadpool::managed::Metrics
-    ) -> deadpool::managed::RecycleResult<SqlxError> {
-        Ok(obj.ping().await?)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Sqlite,
+    Postgres,
 }
 
 #[derive(Clone)]
 pub struct Database {
-    pool: Pool,
+    pool: AnyPool,
+    backend: Backend,
 }
 
 #[derive(Default)]
@@ -45,60 +30,84 @@ pub struct Peer {
     pub status: i64,
 }
 
+impl Peer {
+    fn from_row(row: &AnyRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            guid: row.try_get::<Vec<u8>, _>("guid")?,
+            id: row.try_get::<String, _>("id")?,
+            uuid: row.try_get::<Vec<u8>, _>("uuid")?,
+            pk: row.try_get::<Vec<u8>, _>("pk")?,
+            user: row.try_get::<Vec<u8>, _>("user").ok(),
+            info: row.try_get::<String, _>("info")?,
+            status: row.try_get::<i64, _>("status").unwrap_or(0),
+        })
+    }
+}
+
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
-        if !std::path::Path::new(url).exists() {
-            std::fs::File::create(url).ok();
-        }
-        let deadpool_default_size = num_cpus::get()*4; // cf: https://docs.rs/deadpool/0.12.1/deadpool/managed/struct.PoolConfig.html#structfield.max_size
-        let n: usize = std::env::var("MAX_DATABASE_CONNECTIONS")
-            .unwrap_or_else(|_| deadpool_default_size.to_string().to_owned())
-            .parse()
-            .unwrap_or(1);
-        log::info!("MAX_DATABASE_CONNECTIONS={}", n);
+        install_default_drivers();
 
-        let pool = Pool::builder(DbPool {
-            url: url.to_owned(),
-        }).max_size(n).build().unwrap();
-        let _ = pool.get().await?; // test
-        let db = Database { pool };
+        let url = normalize_url(url);
+        let backend = if url.starts_with("postgres") {
+            Backend::Postgres
+        } else {
+            Backend::Sqlite
+        };
+
+        if backend == Backend::Sqlite {
+            let path = url.strip_prefix("sqlite://").unwrap_or(&url);
+            if !std::path::Path::new(path).exists() {
+                std::fs::File::create(path).ok();
+            }
+        }
+
+        let max_connections: u32 = std::env::var("MAX_DATABASE_CONNECTIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or((num_cpus::get() * 4) as u32);
+        log::info!(
+            "Database backend={:?}, max_connections={}",
+            backend,
+            max_connections
+        );
+
+        let pool = AnyPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(&url)
+            .await?;
+
+        let db = Database { pool, backend };
         db.create_tables().await?;
         Ok(db)
     }
 
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
     async fn create_tables(&self) -> ResultType<()> {
-        sqlx::query!(
-            "
-            create table if not exists peer (
-                guid blob primary key not null,
-                id varchar(100) not null,
-                uuid blob not null,
-                pk blob not null,
-                created_at datetime not null default(current_timestamp),
-                user blob,
-                status tinyint,
-                note varchar(300),
-                info text not null
-            ) without rowid;
-            create unique index if not exists index_peer_id on peer (id);
-            create index if not exists index_peer_user on peer (user);
-            create index if not exists index_peer_created_at on peer (created_at);
-            create index if not exists index_peer_status on peer (status);
-        "
-        )
-        .execute(self.pool.get().await?.deref_mut())
-        .await?;
+        let schema = match self.backend {
+            Backend::Sqlite => SCHEMA_SQLITE,
+            Backend::Postgres => SCHEMA_POSTGRES,
+        };
+        for statement in split_sql(schema) {
+            sqlx::query(statement).execute(&self.pool).await?;
+        }
         Ok(())
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
-        Ok(sqlx::query_as!(
-            Peer,
-            r#"select guid, id, uuid, pk, user, status, info as "info!: String" from peer where id = ?"#,
-            id
+        let row = sqlx::query(
+            "SELECT guid, id, uuid, pk, \"user\", status, info FROM peer WHERE id = $1",
         )
-        .fetch_optional(self.pool.get().await?.deref_mut())
-        .await?)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => Ok(Some(Peer::from_row(&row)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn insert_peer(
@@ -109,15 +118,15 @@ impl Database {
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
-        sqlx::query!(
-            "insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
-            guid,
-            id,
-            uuid,
-            pk,
-            info
+        sqlx::query(
+            "INSERT INTO peer(guid, id, uuid, pk, info) VALUES($1, $2, $3, $4, $5)",
         )
-        .execute(self.pool.get().await?.deref_mut())
+        .bind(&guid)
+        .bind(id)
+        .bind(uuid)
+        .bind(pk)
+        .bind(info)
+        .execute(&self.pool)
         .await?;
         Ok(guid)
     }
@@ -129,17 +138,33 @@ impl Database {
         pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
-        sqlx::query!(
-            "update peer set id=?, pk=?, info=? where guid=?",
-            id,
-            pk,
-            info,
-            guid
-        )
-        .execute(self.pool.get().await?.deref_mut())
-        .await?;
+        sqlx::query("UPDATE peer SET id=$1, pk=$2, info=$3 WHERE guid=$4")
+            .bind(id)
+            .bind(pk)
+            .bind(info)
+            .bind(guid)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
+}
+
+/// Normalize a database URL for sqlx::Any.
+/// Bare file paths (legacy) are converted to sqlite:// URLs.
+fn normalize_url(url: &str) -> String {
+    if url.starts_with("sqlite://") || url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        url.to_string()
+    } else {
+        format!("sqlite://{}", url)
+    }
+}
+
+/// Split a SQL script into individual statements, skipping empty lines and comments.
+fn split_sql(sql: &str) -> Vec<&str> {
+    sql.split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -147,18 +172,60 @@ mod tests {
     use super::*;
     use hbb_common::tokio;
 
-    async fn temp_db() -> Database {
+    async fn test_db_sqlite() -> Database {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sqlite3");
-        let db = Database::new(path.to_str().unwrap()).await.unwrap();
-        // Leak the tempdir so it lives until process exit
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::new(&url).await.unwrap();
         std::mem::forget(dir);
         db
     }
 
-    #[tokio::test]
-    async fn test_insert_and_get_peer() {
-        let db = temp_db().await;
+    async fn test_db_postgres() -> Database {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must be set for postgres tests");
+        let db_name = format!("test_{}", uuid::Uuid::new_v4().as_simple());
+        // Connect to the base URL to create the test database
+        install_default_drivers();
+        let admin_pool = AnyPool::connect(&url).await.unwrap();
+        sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
+            .execute(&admin_pool)
+            .await
+            .unwrap();
+        admin_pool.close().await;
+
+        let test_url = if url.ends_with('/') {
+            format!("{}{}", url, db_name)
+        } else {
+            format!("{}/{}", url.rsplit_once('/').map(|(base, _)| base).unwrap_or(&url), db_name)
+        };
+        let db = Database::new(&test_url).await.unwrap();
+
+        // Store cleanup info — in a real setup we'd drop this DB on teardown.
+        // For tests, leaked databases are acceptable (CI cleans up).
+        db
+    }
+
+    macro_rules! db_test {
+        ($name:ident, |$db:ident| $body:block) => {
+            paste::paste! {
+                #[tokio::test]
+                async fn [<$name _sqlite>]() {
+                    let $db = test_db_sqlite().await;
+                    $body
+                }
+
+                #[tokio::test]
+                #[cfg_attr(not(feature = "postgres-tests"), ignore)]
+                async fn [<$name _postgres>]() {
+                    let $db = test_db_postgres().await;
+                    $body
+                }
+            }
+        };
+    }
+
+    db_test!(insert_and_get_peer, |db| {
         let uuid = b"test-uuid-bytes!";
         let pk = b"test-pk-bytes!!!";
         let info = r#"{"ip":"10.0.0.1"}"#;
@@ -171,18 +238,14 @@ mod tests {
         assert_eq!(peer.uuid, uuid.to_vec());
         assert_eq!(peer.pk, pk.to_vec());
         assert_eq!(peer.info, info);
-    }
+    });
 
-    #[tokio::test]
-    async fn test_get_peer_not_found() {
-        let db = temp_db().await;
+    db_test!(get_peer_not_found, |db| {
         let result = db.get_peer("nonexistent").await.unwrap();
         assert!(result.is_none());
-    }
+    });
 
-    #[tokio::test]
-    async fn test_update_pk() {
-        let db = temp_db().await;
+    db_test!(update_pk, |db| {
         let uuid = b"test-uuid-bytes!";
         let pk = b"test-pk-bytes!!!";
         let info = r#"{"ip":"10.0.0.1"}"#;
@@ -196,22 +259,18 @@ mod tests {
         let peer = db.get_peer("peer456").await.unwrap().unwrap();
         assert_eq!(peer.pk, new_pk.to_vec());
         assert_eq!(peer.info, new_info);
-    }
+    });
 
-    #[tokio::test]
-    async fn test_insert_duplicate_id_fails() {
-        let db = temp_db().await;
+    db_test!(insert_duplicate_id_fails, |db| {
         let uuid = b"test-uuid-bytes!";
         let pk = b"test-pk-bytes!!!";
 
         db.insert_peer("dup_id", uuid, pk, "{}").await.unwrap();
         let result = db.insert_peer("dup_id", uuid, pk, "{}").await;
         assert!(result.is_err());
-    }
+    });
 
-    #[tokio::test]
-    async fn test_update_pk_changes_id() {
-        let db = temp_db().await;
+    db_test!(update_pk_changes_id, |db| {
         let uuid = b"test-uuid-bytes!";
         let pk = b"test-pk-bytes!!!";
 
@@ -223,11 +282,9 @@ mod tests {
 
         let new = db.get_peer("new_id").await.unwrap();
         assert!(new.is_some());
-    }
+    });
 
-    #[tokio::test]
-    async fn test_concurrent_insert_and_read() {
-        let db = temp_db().await;
+    db_test!(concurrent_insert_and_read, |db| {
         let mut jobs = vec![];
         for i in 0..100 {
             let cloned = db.clone();
@@ -245,5 +302,5 @@ mod tests {
             }));
         }
         hbb_common::futures::future::join_all(jobs).await;
-    }
+    });
 }
