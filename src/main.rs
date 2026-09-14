@@ -2,44 +2,10 @@
 // https://blog.csdn.net/bytxl/article/details/44344855
 
 use flexi_logger::*;
-use hbb_common::{bail, config::RENDEZVOUS_PORT,config::API_PORT, ResultType};
+use hbb_common::{bail, config::RENDEZVOUS_PORT, ResultType};
 use hbbs::{common::*, *};
-use rocket::{
-    config::LogLevel,
-    data::{Limits, ToByteUnit},
-};
-
-use std::thread;
-use sctgdesk_api_server::build_rocket;
 
 const RMEM: usize = 0;
-
-fn get_rocket_log_level() -> LogLevel {
-    let log_level_env = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    match log_level_env.as_str() {
-        "off" => return LogLevel::Off,
-        "error" => return LogLevel::Critical,
-        "warn" => return LogLevel::Normal,
-        "info" => return LogLevel::Normal,
-        "debug" => return LogLevel::Debug,
-        "trace" => return LogLevel::Debug,
-        _ => return LogLevel::Off
-        
-    }
-}
-#[rocket::main]
-async fn start_rocket() -> ResultType<()> {
-    let port = get_arg_or("api-port", API_PORT.to_string()).parse::<i32>()?;
-    let figment = rocket::Config::figment()
-        .merge(("address", "0.0.0.0"))
-        .merge(("port", port))
-        .merge(("log_level", get_rocket_log_level()))
-        .merge(("secret_key", "wJq+s/xvwZjmMX3ev0p4gQTs9Ej5wt0brsk3ZGhoBTg="))
-        .merge(("ident",  format!("SCTGDeskServer/{}", env!("CARGO_PKG_VERSION"))))
-        .merge(("limits", Limits::new().limit("json", 2.mebibytes())));
-    let _rocket = build_rocket(figment).await.ignite().await?.launch().await;
-    Ok(())
-}
 
 fn log_format(
     write: &mut dyn std::io::Write,
@@ -69,7 +35,6 @@ fn main() -> ResultType<()> {
         .start()?;
     let args = format!(
         "-c --config=[FILE] +takes_value 'Sets a custom config file'
-        -a, --api-port=[NUMBER(default={API_PORT})] 'Sets the listening port of API server'
         -p, --port=[NUMBER(default={RENDEZVOUS_PORT})] 'Sets the listening port'
         -s, --serial=[NUMBER(default=0)] 'Sets configure update serial number'
         -R, --rendezvous-servers=[HOSTS] 'Sets rendezvous servers, separated by comma'
@@ -88,19 +53,6 @@ fn main() -> ResultType<()> {
     let rmem = get_arg("rmem").parse::<usize>().unwrap_or(RMEM);
     let serial: i32 = get_arg("serial").parse().unwrap_or(0);
 
-    std::env::set_var("MAIN_PKG_VERSION", env!("CARGO_PKG_VERSION"));
-    let handle = thread::spawn(|| {
-        let rt = rocket::tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let _ = sctgdesk_api_server::ApiState::new_with_db("db_v2.sqlite3").await;
-        });
-    });
-    handle.join().unwrap();
-    let rocket_thread = thread::spawn(|| {
-        let _ = start_rocket();
-    });
-
     RendezvousServer::start(port, serial, &get_arg_or("key", "-".to_owned()), rmem)?;
-    let _ = rocket_thread.join();
     Ok(())
 }

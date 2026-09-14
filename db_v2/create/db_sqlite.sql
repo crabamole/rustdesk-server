@@ -3,14 +3,14 @@ CREATE TABLE IF NOT EXISTS peer (
     id varchar(100) NOT NULL,
     uuid blob NOT NULL,
     pk blob NOT NULL,
-    created_at datetime NOT NULL DEFAULT(current_timestamp),
+    created_at text NOT NULL DEFAULT(current_timestamp),
     "user" blob,
     status tinyint NOT NULL DEFAULT(1),
     note varchar(300),
     region text,
     strategy blob,
     info text NOT NULL DEFAULT '{}',
-    last_online datetime NOT NULL DEFAULT('2011-11-16 11:55:19')
+    last_online text NOT NULL DEFAULT('2011-11-16 11:55:19')
 ) WITHOUT ROWID;
 CREATE UNIQUE INDEX IF NOT EXISTS index_peer_id ON peer (id);
 CREATE INDEX IF NOT EXISTS index_peer_user ON peer ("user");
