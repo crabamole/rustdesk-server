@@ -35,6 +35,19 @@ fn main() -> ResultType<()> {
             port = v + 1;
         }
     }
+
+    #[cfg(all(unix, feature = "coverage"))]
+    {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        unsafe {
+            let _ = signal_hook::low_level::register(signal_hook::consts::SIGUSR1, || {
+                let _ = __llvm_profile_write_file();
+            });
+        }
+    }
+
     start(
         matches.value_of("port").unwrap_or(&port.to_string()),
         matches

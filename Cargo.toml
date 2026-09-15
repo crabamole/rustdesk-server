@@ -17,6 +17,7 @@ path = "src/utils.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+signal-hook = "0.3"
 hbb_common = { path = "libs/hbb_common" }
 serde_derive = "1.0"
 serde = "1.0"
@@ -66,6 +67,7 @@ tempfile = "3"
 paste = "1"
 
 [features]
+coverage = []
 integration-test = ["tempfile"]
 postgres-tests = []
 

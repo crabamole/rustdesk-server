@@ -53,6 +53,18 @@ fn main() -> ResultType<()> {
     let rmem = get_arg("rmem").parse::<usize>().unwrap_or(RMEM);
     let serial: i32 = get_arg("serial").parse().unwrap_or(0);
 
+    #[cfg(all(unix, feature = "coverage"))]
+    {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        unsafe {
+            let _ = signal_hook::low_level::register(signal_hook::consts::SIGUSR1, || {
+                let _ = __llvm_profile_write_file();
+            });
+        }
+    }
+
     RendezvousServer::start(port, serial, &get_arg_or("key", "-".to_owned()), rmem)?;
     Ok(())
 }
