@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:experimental
 FROM node:lts-bookworm AS builder
 ENV NODE_VERSION=20.18.0
-RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev zip git sqlite3 musl-dev musl-tools
+RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev zip git sqlite3 musl-dev musl-tools perl
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 RUN echo $(dpkg --print-architecture)
 RUN mkdir /build
@@ -35,7 +35,7 @@ RUN --mount=type=tmpfs,target=/root/.cargo export TARGET=$(cat /build/_target) \
     awk 'BEGIN{net_section=0;git_fetch_found=0;printed=0}/^\[net\]/{net_section=1;print;next}/^\[/{if(net_section&&!git_fetch_found){print "git-fetch-with-cli = true";printed=1}net_section=0;print;next}net_section&&/^git-fetch-with-cli\s*=/{print "git-fetch-with-cli = true";git_fetch_found=1;next}{print}END{if(!printed&&!git_fetch_found){if(!net_section)print "\n[net]";print "git-fetch-with-cli = true"}}' /root/.cargo/config.toml > /root/.cargo/config.tmp && \
     mv /root/.cargo/config.tmp /root/.cargo/config.toml \
     && . /root/.cargo/env && cd /build \
-    && RUSTFLAGS="-C instrument-coverage --remap-path-prefix=/build=sctgdesk-server" cargo build --features coverage --target=$TARGET --release -j2 \
+    && RUSTFLAGS="-C instrument-coverage --remap-path-prefix=/build=sctgdesk-server" cargo build --features coverage,vendored-openssl --target=$TARGET --release -j2 \
     && mkdir -p /build/output \
     && cp /build/target/$(cat /build/_target)/release/hbbr /build/output/ \
     && cp /build/target/$(cat /build/_target)/release/hbbs /build/output/ \
