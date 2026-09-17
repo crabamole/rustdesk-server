@@ -59,6 +59,7 @@ local-ip-address = "0.6"
 dns-lookup = "2.0"
 ping = "0.5"
 num_cpus = "1.16"
+flate2 = "1.0"
 
 reqwest = { version = "0.12", default-features = false, features = ["json","rustls-tls"] }
 
@@ -81,3 +82,13 @@ hbb_common = { path = "libs/hbb_common" }
 [workspace]
 members = ["libs/hbb_common"]
 exclude = ["ui"]
+
+#https://github.com/johnthagen/min-sized-rust
+#https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+#opt-level = 'z' # only have smaller size after strip # Default is 3, better performance
+#rpath = true # Not needed

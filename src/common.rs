@@ -1,7 +1,6 @@
 use clap::App;
 use hbb_common::{
-    anyhow::{Context, Result},
-    log, ResultType,
+    allow_err, anyhow::{Context, Result}, get_version_number, log, tokio, ResultType
 };
 use ini::Ini;
 use sodiumoxide::crypto::sign;
@@ -193,6 +192,33 @@ pub async fn listen_signal() -> Result<()> {
     unreachable!();
 }
 
+pub fn check_software_update() {
+    const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
+    std::thread::spawn(move || loop {
+        std::thread::spawn(move || allow_err!(check_software_update_()));
+        std::thread::sleep(std::time::Duration::from_secs(ONE_DAY_IN_SECONDS));
+    });
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn check_software_update_() -> hbb_common::ResultType<()> {
+    let (request, url) = hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
+    let latest_release_response = reqwest::Client::builder().build()?
+        .post(url)
+        .json(&request)
+        .send()
+        .await?;
+
+    let bytes = latest_release_response.bytes().await?;
+    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
+    let response_url = resp.url;
+    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
+    if get_version_number(&latest_release_version) > get_version_number(crate::version::VERSION) {
+       log::info!("new version is available: {}", latest_release_version);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,15 +322,12 @@ mod tests {
         let sk_b64 = base64::encode(&sk.0);
         std::fs::write(&sk_path, &sk_b64).unwrap();
 
-        // gen_sk reads from current dir, so we need to call from the tempdir
-        // Instead, test the parsing logic directly
         let decoded = base64::decode(sk_b64.trim()).unwrap();
         assert_eq!(decoded.len(), sign::SECRETKEYBYTES);
-        let mut tmp = [0u8; 64]; // SECRETKEYBYTES = 64
+        let mut tmp = [0u8; 64];
         tmp[..].copy_from_slice(&decoded);
         let pk_derived = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
         assert!(!pk_derived.is_empty());
-        // Cleanup
         drop(dir);
     }
 
@@ -312,13 +335,11 @@ mod tests {
     fn test_gen_sk_generates_new_key_pair() {
         let dir = tempfile::tempdir().unwrap();
         let old_dir = std::env::current_dir().unwrap();
-        // Can't safely change dir in parallel tests, so test the generation logic
         use sodiumoxide::crypto::sign;
         let (pk, sk) = sign::gen_keypair();
         let pk_encoded = base64::encode(pk);
         let sk_encoded = base64::encode(&sk);
 
-        // Verify the keypair can be round-tripped
         let sk_decoded = base64::decode(&sk_encoded).unwrap();
         assert_eq!(sk_decoded.len(), sign::SECRETKEYBYTES);
 
@@ -331,7 +352,6 @@ mod tests {
 
     #[test]
     fn test_gen_sk_malformed_key_short() {
-        // Verify that a short key would be rejected
         let short_key = base64::encode(b"tooshort");
         let decoded = base64::decode(&short_key).unwrap();
         assert_ne!(decoded.len(), sodiumoxide::crypto::sign::SECRETKEYBYTES);
@@ -339,8 +359,6 @@ mod tests {
 
     #[test]
     fn test_init_args_does_not_panic_with_no_args() {
-        // init_args reads CLI args and .env - we can't fully test without mocking,
-        // but we can verify arg_name is used consistently
         assert_eq!(arg_name("relay_servers"), "RELAY-SERVERS");
         assert_eq!(arg_name("key"), "KEY");
         assert_eq!(arg_name("serial"), "SERIAL");
@@ -348,7 +366,6 @@ mod tests {
 
     #[test]
     fn test_gen_sk_key_derivation_logic() {
-        // Test the key derivation logic used in gen_sk without changing cwd
         let (_, sk) = sign::gen_keypair();
         let sk_b64 = base64::encode(&sk.0);
         let decoded = base64::decode(&sk_b64).unwrap();
@@ -359,19 +376,15 @@ mod tests {
         let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
         assert!(!pk.is_empty());
 
-        // Verify it matches expected public key
         let (expected_pk, _) = sign::gen_keypair();
-        // Different pair, just checking format
         assert_eq!(pk.len(), base64::encode(expected_pk).len());
     }
 
     #[test]
     fn test_gen_sk_pk_filter_logic() {
-        // gen_sk filters PKs containing / or : (up to 300 attempts)
         for _ in 0..10 {
             let (pk, _) = sign::gen_keypair();
             let encoded = base64::encode(pk);
-            // Most keys won't contain / or :, verify the format
             assert!(encoded.len() > 0);
         }
     }
