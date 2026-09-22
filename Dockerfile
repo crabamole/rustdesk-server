@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:experimental
 FROM node:lts-bookworm AS builder
-ARG COVERAGE=false
 ENV NODE_VERSION=20.18.0
 RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev zip git sqlite3 musl-dev musl-tools perl
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -27,6 +26,7 @@ COPY Cargo.toml /build/Cargo.toml
 COPY Cargo.lock /build/Cargo.lock
 COPY build.rs /build/build.rs
 RUN mv /root/.cargo /tmp && rm -rf /root/.cargo && mkdir -p /root/.cargo
+ARG COVERAGE=false
 RUN --mount=type=tmpfs,target=/root/.cargo export TARGET=$(cat /build/_target) \
     && mkdir -p /root/.cargo \
     && cp -av /tmp/.cargo/* /root/.cargo/ && ls -lR /root/.cargo \
