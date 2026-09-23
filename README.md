@@ -307,19 +307,21 @@ Self-host your own RustDesk server, it is free and open source.
 
 First you need to have a working Rust development toolchain and a Node ≥ 20 working installation.  
 
-* Unices (Linux, MacOS, etc.):
-
 ```bash
-DATABASE_URL=sqlite://$(pwd)/db_v2.sqlite3 cargo build --release
-```
-
-* Windows with cmd.exe shell:
-
-```cmd
-set "DATABASE_URL=sqlite://%CD%/db_v2.sqlite3" && cargo build --release
+cargo build --release
 ```
 
 Three executables will be generated in target/release.
+
+hbbs requires PostgreSQL. Point it at your database with `DB_URL=postgres://user:pass@host:5432/db`. The database schema is created by [sctgdesk-api-server](https://github.com/sctg-development/sctgdesk-api-server), which must be started against the same database before hbbs connects — hbbs itself never creates or migrates the schema, it only waits for it to be ready.
+
+To run hbbs locally against a throwaway Postgres instance:
+
+```bash
+docker run -d --name hbbs-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17-alpine
+# start sctgdesk-api-server with DATABASE_URL pointing at the same database first; it creates the schema
+DB_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres ./target/release/hbbs
+```
 
 * hbbs - RustDesk ID/Rendezvous server with API server
 * hbbr - RustDesk relay server
