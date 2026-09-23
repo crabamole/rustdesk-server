@@ -315,6 +315,8 @@ Three executables will be generated in target/release.
 
 hbbs requires PostgreSQL. Point it at your database with `DB_URL=postgres://user:pass@host:5432/db`. The database schema is created by [sctgdesk-api-server](https://github.com/sctg-development/sctgdesk-api-server), which must be started against the same database before hbbs connects — hbbs itself never creates or migrates the schema, it only waits for it to be ready.
 
+`MAX_DATABASE_CONNECTIONS` sets hbbs's Postgres connection pool size (default `num_cpus * 4`). Since hbbs and sctgdesk-api-server each open their own pool against the same database, size this (together with the api-server's equivalent setting) so the total stays within Postgres's `max_connections`.
+
 To run hbbs locally against a throwaway Postgres instance:
 
 ```bash

@@ -29,7 +29,6 @@ tar cf - \
     --exclude .git \
     Cargo.toml Cargo.lock \
 	LICENSE README.md \
-    db_v2.sqlite3 \
 	build.rs \
 	debian \
 	libs rcd src \
