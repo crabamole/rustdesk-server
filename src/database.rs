@@ -10,6 +10,25 @@ pub struct Database {
     pool: PgPool,
 }
 
+/// Marks a `new()` failure as "connected fine, but the api-server hasn't
+/// created the schema yet", as opposed to any other failure (e.g. Postgres
+/// unreachable). Kept as a distinct type instead of matching on the error
+/// text so `connect_with_retry` can tell the two apart reliably.
+#[derive(Debug)]
+struct SchemaNotReady(sqlx::Error);
+
+impl std::fmt::Display for SchemaNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "schema not ready (table peer not found; it is created by the api-server): {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SchemaNotReady {}
+
 #[derive(Default)]
 pub struct Peer {
     pub guid: Vec<u8>,
@@ -53,7 +72,7 @@ impl Database {
             .await?;
         if let Err(e) = sqlx::query("SELECT 1 FROM peer LIMIT 1").fetch_optional(&pool).await {
             pool.close().await;
-            hbb_common::bail!("schema not ready (table peer not found; it is created by the api-server): {e}");
+            return Err(SchemaNotReady(e).into());
         }
         log::info!("Database ready, max_connections={max_connections}");
         Ok(Database { pool })
@@ -68,7 +87,7 @@ impl Database {
                 Ok(db) => return db,
                 Err(e) => {
                     let delay = backoff.next_delay();
-                    log::warn!("database not ready ({e}), retrying in {}s", delay.as_secs());
+                    log::warn!("{}", retry_log_message(&e, delay));
                     hbb_common::tokio::time::sleep(delay).await;
                 }
             }
@@ -127,6 +146,21 @@ impl Database {
     }
 }
 
+/// Log text for a `connect_with_retry` attempt that failed with `e`, about to
+/// retry after `delay`. Distinguishes "connected fine, schema not created
+/// yet" (`SchemaNotReady`, api-server's job) from any other failure (e.g.
+/// Postgres unreachable) by error type rather than by matching on text.
+fn retry_log_message(e: &hbb_common::anyhow::Error, delay: Duration) -> String {
+    if e.downcast_ref::<SchemaNotReady>().is_some() {
+        format!(
+            "waiting for schema (created by api-server), retrying in {}s",
+            delay.as_secs()
+        )
+    } else {
+        format!("database not ready ({e}), retrying in {}s", delay.as_secs())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +180,17 @@ mod tests {
                 $body
             }
         };
+    }
+
+    #[test]
+    fn retry_log_message_distinguishes_schema_not_ready() {
+        let schema_err: hbb_common::anyhow::Error = SchemaNotReady(sqlx::Error::RowNotFound).into();
+        let msg = retry_log_message(&schema_err, Duration::from_secs(2));
+        assert_eq!(msg, "waiting for schema (created by api-server), retrying in 2s");
+
+        let other_err = hbb_common::anyhow::anyhow!("connection refused");
+        let msg = retry_log_message(&other_err, Duration::from_secs(2));
+        assert_eq!(msg, "database not ready (connection refused), retrying in 2s");
     }
 
     #[tokio::test]

@@ -127,7 +127,15 @@ impl PeerMap {
         let p = self.map.read().await.get(id).cloned();
         if p.is_some() {
             return p;
-        } else if let Ok(Some(v)) = self.db.get_peer(id).await {
+        }
+        let db_peer = match self.db.get_peer(id).await {
+            Ok(v) => v,
+            Err(err) => {
+                log::error!("get_peer({id}) failed: {err}");
+                return None;
+            }
+        };
+        if let Some(v) = db_peer {
             let peer = Peer {
                 guid: v.guid,
                 uuid: v.uuid.into(),
