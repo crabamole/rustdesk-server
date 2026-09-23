@@ -67,26 +67,16 @@ pub(crate) struct PeerMap {
 
 impl PeerMap {
     pub(crate) async fn new() -> ResultType<Self> {
-        let db = std::env::var("DB_URL").unwrap_or({
-            let mut db = "db_v2.sqlite3".to_owned();
-            #[cfg(all(windows, not(debug_assertions)))]
-            {
-                if let Some(path) = hbb_common::config::Config::icon_path().parent() {
-                    db = format!("{}\\{}", path.to_str().unwrap_or("."), db);
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                db = format!("./{db}");
-            }
-            db
-        });
-        log::info!("DB_URL={}", db);
-        let pm = Self {
+        let db_url = std::env::var("DB_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                hbb_common::anyhow::anyhow!("DB_URL is required (postgres://user:pass@host:5432/db)")
+            })?;
+        Ok(Self {
             map: Default::default(),
-            db: database::Database::new(&db).await?,
-        };
-        Ok(pm)
+            db: database::Database::connect_with_retry(&db_url).await,
+        })
     }
 
     #[inline]
@@ -196,6 +186,13 @@ mod tests {
             .await
             .unwrap();
         PeerMap::new_with_db(db)
+    }
+
+    #[tokio::test]
+    async fn peer_map_requires_db_url() {
+        std::env::remove_var("DB_URL");
+        let err = PeerMap::new().await.err().expect("expected error without DB_URL");
+        assert!(err.to_string().contains("DB_URL is required"), "{err}");
     }
 
     #[tokio::test]

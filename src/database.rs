@@ -59,6 +59,22 @@ impl Database {
         Ok(Database { pool })
     }
 
+    /// Connect and wait for the schema, retrying until it succeeds. Kubernetes'
+    /// startupProbe decides when to give up and restart the container.
+    pub async fn connect_with_retry(url: &str) -> Database {
+        let mut backoff = crate::retry::Backoff::new();
+        loop {
+            match Self::new(url).await {
+                Ok(db) => return db,
+                Err(e) => {
+                    let delay = backoff.next_delay();
+                    log::warn!("database not ready ({e}), retrying in {}s", delay.as_secs());
+                    hbb_common::tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
         let row = sqlx::query(
             "SELECT guid, id, uuid, pk, \"user\", status, info FROM peer WHERE id = $1",
@@ -215,6 +231,38 @@ mod tests {
         let new = db.get_peer("new_id").await.unwrap();
         assert!(new.is_some());
     });
+
+    #[tokio::test]
+    async fn new_reports_real_cause_when_unreachable() {
+        let err = hbb_common::tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Database::new("postgres://postgres:postgres@127.0.0.1:1/none"),
+        )
+        .await
+        .expect("Database::new did not return within 10s")
+        .err()
+        .expect("expected error");
+        assert!(!err.to_string().contains("pool timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn connect_with_retry_waits_for_schema() {
+        let url = crate::testing::fresh_database_url().await;
+        let url2 = url.clone();
+        // Create the schema 2s after hbbs starts waiting, as the api-server would.
+        hbb_common::tokio::spawn(async move {
+            hbb_common::tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&url2).await.unwrap();
+            sqlx::Executor::execute(&mut c, include_str!("../tests/fixtures/peer.sql")).await.unwrap();
+        });
+        let db = hbb_common::tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            Database::connect_with_retry(&url),
+        )
+        .await
+        .expect("connect_with_retry did not return after the schema appeared");
+        assert!(db.get_peer("nobody").await.unwrap().is_none());
+    }
 
     db_test!(concurrent_insert_and_read, |db| {
         let mut jobs = vec![];
