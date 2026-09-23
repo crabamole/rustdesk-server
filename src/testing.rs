@@ -2,6 +2,7 @@
 //! test process runs; every call returns a new empty database on it.
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hbb_common::log;
 use hbb_common::tokio::sync::OnceCell;
 use sqlx::{Connection, Executor, PgConnection, Row};
 use testcontainers::runners::AsyncRunner;
@@ -53,15 +54,31 @@ async fn container() -> &'static PgContainer {
 /// Runs once per process, right after the shared container comes up, so a
 /// long-lived reused container doesn't accumulate one database per test run
 /// forever.
+///
+/// Best-effort: this runs inside the container's `OnceCell` init, so a
+/// panic here would fail every test in the process. Concurrent test
+/// processes can race to drop the same stale database, so listing and
+/// dropping failures are logged and skipped rather than unwrapped.
 async fn drop_stale_databases(base_url: &str) {
-    let mut admin = PgConnection::connect(&format!("{base_url}/postgres"))
-        .await
-        .unwrap();
+    let mut admin = match PgConnection::connect(&format!("{base_url}/postgres")).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            log::warn!("drop_stale_databases: could not connect to admin database: {e}");
+            return;
+        }
+    };
 
-    let rows = admin
+    let rows = match admin
         .fetch_all("SELECT datname FROM pg_database WHERE datname LIKE 'test\\_%'")
         .await
-        .unwrap();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("drop_stale_databases: could not list test databases: {e}");
+            let _ = admin.close().await;
+            return;
+        }
+    };
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -76,13 +93,15 @@ async fn drop_stale_databases(base_url: &str) {
         if now.saturating_sub(created_at) < STALE_DATABASE_MAX_AGE_SECS {
             continue;
         }
-        admin
+        if let Err(e) = admin
             .execute(format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)").as_str())
             .await
-            .unwrap();
+        {
+            log::warn!("drop_stale_databases: could not drop stale database {name}: {e}");
+        }
     }
 
-    admin.close().await.unwrap();
+    let _ = admin.close().await;
 }
 
 /// Parses the unix-seconds timestamp embedded in a `test_<unix_seconds>_<uuid_simple>`
