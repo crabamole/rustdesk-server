@@ -2,7 +2,6 @@
 //! test process runs; every call returns a new empty database on it.
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hbb_common::log;
 use hbb_common::tokio::sync::OnceCell;
 use sqlx::{Connection, Executor, PgConnection, Row};
 use testcontainers::runners::AsyncRunner;
@@ -55,15 +54,18 @@ async fn container() -> &'static PgContainer {
 /// long-lived reused container doesn't accumulate one database per test run
 /// forever.
 ///
-/// Best-effort: this runs inside the container's `OnceCell` init, so a
-/// panic here would fail every test in the process. Concurrent test
-/// processes can race to drop the same stale database, so listing and
-/// dropping failures are logged and skipped rather than unwrapped.
+/// Best-effort: this cleanup races with other test processes doing the same
+/// thing against the same shared container (e.g. one process may already
+/// have dropped a database another is about to drop), so failures here are
+/// logged and skipped rather than propagated — they must never fail the
+/// `OnceCell` init and take down every test in the process with them. Uses
+/// `eprintln!` rather than the app's `log` macros, since the logger isn't
+/// necessarily initialized in a test process.
 async fn drop_stale_databases(base_url: &str) {
     let mut admin = match PgConnection::connect(&format!("{base_url}/postgres")).await {
         Ok(conn) => conn,
-        Err(e) => {
-            log::warn!("drop_stale_databases: could not connect to admin database: {e}");
+        Err(err) => {
+            eprintln!("testing::drop_stale_databases: failed to connect, skipping cleanup: {err}");
             return;
         }
     };
@@ -73,8 +75,8 @@ async fn drop_stale_databases(base_url: &str) {
         .await
     {
         Ok(rows) => rows,
-        Err(e) => {
-            log::warn!("drop_stale_databases: could not list test databases: {e}");
+        Err(err) => {
+            eprintln!("testing::drop_stale_databases: failed to list databases, skipping cleanup: {err}");
             let _ = admin.close().await;
             return;
         }
@@ -93,11 +95,11 @@ async fn drop_stale_databases(base_url: &str) {
         if now.saturating_sub(created_at) < STALE_DATABASE_MAX_AGE_SECS {
             continue;
         }
-        if let Err(e) = admin
+        if let Err(err) = admin
             .execute(format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)").as_str())
             .await
         {
-            log::warn!("drop_stale_databases: could not drop stale database {name}: {e}");
+            eprintln!("testing::drop_stale_databases: failed to drop \"{name}\", skipping: {err}");
         }
     }
 
