@@ -17,3 +17,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS index_peer_id on peer (id);
 CREATE INDEX IF NOT EXISTS index_peer_user on peer ("user");
 CREATE INDEX IF NOT EXISTS index_peer_created_at on peer (created_at);
 CREATE INDEX IF NOT EXISTS index_peer_status on peer (status);
+CREATE INDEX IF NOT EXISTS index_peer_strategy ON peer (strategy);
