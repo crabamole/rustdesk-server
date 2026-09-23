@@ -192,10 +192,9 @@ mod tests {
     use hbb_common::tokio;
 
     async fn temp_peer_map() -> PeerMap {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.sqlite3");
-        let db = database::Database::new(path.to_str().unwrap()).await.unwrap();
-        std::mem::forget(dir);
+        let db = database::Database::new(&crate::testing::fresh_peer_database_url().await)
+            .await
+            .unwrap();
         PeerMap::new_with_db(db)
     }
 

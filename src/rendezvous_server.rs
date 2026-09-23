@@ -1639,10 +1639,7 @@ impl TestServer {
 impl RendezvousServer {
     pub async fn start_test(key: &str) -> ResultType<TestServer> {
         let (key, sk) = Self::get_server_sk(key);
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("test.sqlite3");
-        std::mem::forget(dir);
-        let db = crate::database::Database::new(path.to_str().unwrap()).await?;
+        let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await?;
         let pm = PeerMap::new_with_db(db);
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
@@ -1961,11 +1958,7 @@ mod tests {
     }
 
     async fn test_server() -> (RendezvousServer, Receiver) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.sqlite3");
-        std::mem::forget(dir);
-
-        let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+        let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
         let pm = PeerMap::new_with_db(db);
         let (tx, rx) = mpsc::unbounded_channel();
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
@@ -2417,11 +2410,7 @@ mod tests {
     }
 
     async fn test_server_with_sk() -> (RendezvousServer, Receiver) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.sqlite3");
-        std::mem::forget(dir);
-
-        let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+        let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
         let pm = PeerMap::new_with_db(db);
         let (tx, rx) = mpsc::unbounded_channel();
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
@@ -2865,10 +2854,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_punch_hole_with_lan_mask() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("test.sqlite3");
-            std::mem::forget(dir);
-            let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+            let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
             let pm = PeerMap::new_with_db(db);
             let (tx, rx) = mpsc::unbounded_channel();
             let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
@@ -2910,10 +2896,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_punch_hole_cross_lan_forces_relay() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("test.sqlite3");
-            std::mem::forget(dir);
-            let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+            let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
             let pm = PeerMap::new_with_db(db);
             let (tx, rx) = mpsc::unbounded_channel();
             let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();

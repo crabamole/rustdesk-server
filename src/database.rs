@@ -172,55 +172,18 @@ mod tests {
     use super::*;
     use hbb_common::tokio;
 
-    async fn test_db_sqlite() -> Database {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.sqlite3");
-        let url = format!("sqlite://{}", path.display());
-        let db = Database::new(&url).await.unwrap();
-        std::mem::forget(dir);
-        db
-    }
-
-    async fn test_db_postgres() -> Database {
-        let url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL must be set for postgres tests");
-        let db_name = format!("test_{}", uuid::Uuid::new_v4().as_simple());
-        // Connect to the base URL to create the test database
-        install_default_drivers();
-        let admin_pool = AnyPool::connect(&url).await.unwrap();
-        sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
-            .execute(&admin_pool)
+    async fn test_db() -> Database {
+        Database::new(&crate::testing::fresh_peer_database_url().await)
             .await
-            .unwrap();
-        admin_pool.close().await;
-
-        let test_url = if url.ends_with('/') {
-            format!("{}{}", url, db_name)
-        } else {
-            format!("{}/{}", url.rsplit_once('/').map(|(base, _)| base).unwrap_or(&url), db_name)
-        };
-        let db = Database::new(&test_url).await.unwrap();
-
-        // Store cleanup info — in a real setup we'd drop this DB on teardown.
-        // For tests, leaked databases are acceptable (CI cleans up).
-        db
+            .unwrap()
     }
 
     macro_rules! db_test {
         ($name:ident, |$db:ident| $body:block) => {
-            paste::paste! {
-                #[tokio::test]
-                async fn [<$name _sqlite>]() {
-                    let $db = test_db_sqlite().await;
-                    $body
-                }
-
-                #[tokio::test]
-                #[cfg_attr(not(feature = "postgres-tests"), ignore)]
-                async fn [<$name _postgres>]() {
-                    let $db = test_db_postgres().await;
-                    $body
-                }
+            #[tokio::test]
+            async fn $name() {
+                let $db = test_db().await;
+                $body
             }
         };
     }
