@@ -33,8 +33,6 @@ base64 = "0.22"
 axum = { version = "0.5", features = ["headers"] }
 sqlx = { version = "0.8", features = [
     "runtime-tokio-rustls",
-    "any",
-    "sqlite",
     "postgres",
     "macros",
     "chrono",

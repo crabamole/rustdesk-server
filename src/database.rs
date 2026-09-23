@@ -1,22 +1,13 @@
 use hbb_common::{log, ResultType};
 use sqlx::{
-    any::{install_default_drivers, AnyPoolOptions, AnyRow},
-    AnyPool, Row,
+    postgres::{PgPoolOptions, PgRow},
+    Connection, PgConnection, PgPool, Row,
 };
-
-const SCHEMA_SQLITE: &str = include_str!("../db_v2/create/db_sqlite.sql");
-const SCHEMA_POSTGRES: &str = include_str!("../db_v2/create/db_postgres.sql");
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Backend {
-    Sqlite,
-    Postgres,
-}
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Database {
-    pool: AnyPool,
-    backend: Backend,
+    pool: PgPool,
 }
 
 #[derive(Default)]
@@ -31,70 +22,41 @@ pub struct Peer {
 }
 
 impl Peer {
-    fn from_row(row: &AnyRow) -> Result<Self, sqlx::Error> {
+    fn from_row(row: &PgRow) -> Result<Self, sqlx::Error> {
         Ok(Self {
             guid: row.try_get::<Vec<u8>, _>("guid")?,
             id: row.try_get::<String, _>("id")?,
             uuid: row.try_get::<Vec<u8>, _>("uuid")?,
             pk: row.try_get::<Vec<u8>, _>("pk")?,
-            user: row.try_get::<Vec<u8>, _>("user").ok(),
+            user: row.try_get::<Option<Vec<u8>>, _>("user")?,
             info: row.try_get::<String, _>("info")?,
-            status: row.try_get::<i64, _>("status").unwrap_or(0),
+            status: row.try_get::<i16, _>("status")? as i64,
         })
     }
 }
 
 impl Database {
+    /// One attempt: connect and verify the api-server has created the schema.
+    /// hbbs never creates tables.
     pub async fn new(url: &str) -> ResultType<Database> {
-        install_default_drivers();
-
-        let url = normalize_url(url);
-        let backend = if url.starts_with("postgres") {
-            Backend::Postgres
-        } else {
-            Backend::Sqlite
-        };
-
-        if backend == Backend::Sqlite {
-            let path = url.strip_prefix("sqlite://").unwrap_or(&url);
-            if !std::path::Path::new(path).exists() {
-                std::fs::File::create(path).ok();
-            }
-        }
-
+        // A plain connection first surfaces the real error (e.g. connection refused);
+        // the pool would hide it behind its acquire timeout.
+        PgConnection::connect(url).await?.close().await?;
         let max_connections: u32 = std::env::var("MAX_DATABASE_CONNECTIONS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or((num_cpus::get() * 4) as u32);
-        log::info!(
-            "Database backend={:?}, max_connections={}",
-            backend,
-            max_connections
-        );
-
-        let pool = AnyPoolOptions::new()
+        let pool = PgPoolOptions::new()
             .max_connections(max_connections)
-            .connect(&url)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(url)
             .await?;
-
-        let db = Database { pool, backend };
-        db.create_tables().await?;
-        Ok(db)
-    }
-
-    pub fn backend(&self) -> Backend {
-        self.backend
-    }
-
-    async fn create_tables(&self) -> ResultType<()> {
-        let schema = match self.backend {
-            Backend::Sqlite => SCHEMA_SQLITE,
-            Backend::Postgres => SCHEMA_POSTGRES,
-        };
-        for statement in split_sql(schema) {
-            sqlx::query(statement).execute(&self.pool).await?;
+        if let Err(e) = sqlx::query("SELECT 1 FROM peer LIMIT 1").fetch_optional(&pool).await {
+            pool.close().await;
+            hbb_common::bail!("schema not ready (table peer not found; it is created by the api-server): {e}");
         }
-        Ok(())
+        log::info!("Database ready, max_connections={max_connections}");
+        Ok(Database { pool })
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
@@ -149,24 +111,6 @@ impl Database {
     }
 }
 
-/// Normalize a database URL for sqlx::Any.
-/// Bare file paths (legacy) are converted to sqlite:// URLs.
-fn normalize_url(url: &str) -> String {
-    if url.starts_with("sqlite://") || url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        url.to_string()
-    } else {
-        format!("sqlite://{}", url)
-    }
-}
-
-/// Split a SQL script into individual statements, skipping empty lines and comments.
-fn split_sql(sql: &str) -> Vec<&str> {
-    sql.split(';')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +131,31 @@ mod tests {
             }
         };
     }
+
+    #[tokio::test]
+    async fn new_fails_when_schema_missing() {
+        // Empty database: hbbs must not create tables, it must report the schema is not ready.
+        let url = crate::testing::fresh_database_url().await;
+        let err = Database::new(&url).await.err().expect("expected error on empty database");
+        assert!(err.to_string().contains("schema not ready"), "{err}");
+        // And it must not have created the table.
+        let db_check = sqlx::PgPool::connect(&url).await.unwrap();
+        let exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'peer')",
+        )
+        .fetch_one(&db_check)
+        .await
+        .unwrap();
+        assert!(!exists.0, "hbbs created table peer");
+    }
+
+    db_test!(status_and_user_decode, |db| {
+        let guid = db.insert_peer("status_peer", b"u", b"p", "{}").await.unwrap();
+        let peer = db.get_peer("status_peer").await.unwrap().unwrap();
+        assert_eq!(peer.status, 1, "status smallint default 1 decoded wrong");
+        assert_eq!(peer.user, None);
+        assert_eq!(peer.guid, guid);
+    });
 
     db_test!(insert_and_get_peer, |db| {
         let uuid = b"test-uuid-bytes!";
