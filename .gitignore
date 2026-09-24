@@ -2,8 +2,6 @@ target
 id*
 db*
 debian-build
-debian/.debhelper
-debian/debhelper-build-stamp
 .DS_Store
 .vscode
 src/version.rs

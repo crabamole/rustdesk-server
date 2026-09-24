@@ -5,10 +5,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  Build_docker_and_Linux_binaries:
-    uses: ./.github/workflows/multiarch-docker-hub.yml
-    secrets: inherit
-    
   Build_MacOS_binaries:
     uses: ./.github/workflows/macos-intel-build.yml
     secrets: inherit
