@@ -1,4 +1,4 @@
--- Test fixture. Source of truth: sctgdesk-api-server libs/state/migrations/0001_initial.sql (table peer). Keep in sync.
+-- Test fixture. Source of truth: rustdesk-api libs/state/migrations/0001_initial.sql (table peer). Keep in sync.
 CREATE TABLE IF NOT EXISTS peer (
     guid bytea PRIMARY KEY NOT NULL,
     id varchar(100) NOT NULL,

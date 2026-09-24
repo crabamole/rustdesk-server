@@ -1,7 +1,7 @@
-# sctgdesk-server
+# rustdesk-server
 
 RustDesk ID/rendezvous server (`hbbs`) and relay server (`hbbr`), built to run
-together with [sctgdesk-api-server](https://github.com/rophy/sctgdesk-api-server)
+together with [rustdesk-api](https://github.com/crabamole/rustdesk-api)
 on a shared PostgreSQL database.
 
 This is a fork of [sctg-development/sctgdesk-server](https://github.com/sctg-development/sctgdesk-server),
@@ -11,12 +11,12 @@ Compared to the upstream open-source server it adds:
 - **WebSocket endpoints** for rendezvous (`21118`) and relay (`21119`), including
   peer registration over WebSocket, so desktop clients and the RustDesk web client
   can reach the server through a single HTTPS reverse proxy.
-- **PostgreSQL** peer storage, shared with sctgdesk-api-server.
+- **PostgreSQL** peer storage, shared with rustdesk-api.
 - **Login enforcement**: with `LOGGED_IN_ONLY=Y`, hbbs rejects connection requests
   from clients that are not logged in, validating their tokens against the api-server.
 
 The API server and web console are no longer embedded; they live in
-sctgdesk-api-server.
+rustdesk-api.
 
 ## Components and ports
 
@@ -30,38 +30,38 @@ The NAT test and WebSocket ports follow the main port: `PORT - 1` and `PORT + 2`
 
 ## Requirements
 
-- **PostgreSQL**, shared with sctgdesk-api-server. The api-server owns the schema:
+- **PostgreSQL**, shared with rustdesk-api. The api-server owns the schema:
   start it first against the same database. hbbs never creates or migrates tables;
   at startup it waits until the schema exists.
-- **sctgdesk-api-server**, reachable from hbbs when `LOGGED_IN_ONLY=Y` (set its URL
+- **rustdesk-api**, reachable from hbbs when `LOGGED_IN_ONLY=Y` (set its URL
   with `API_SERVER`).
 
 ## Deployment
 
 ### Kubernetes (recommended)
 
-The Helm chart in [rophy/rustdesk-charts](https://github.com/rophy/rustdesk-charts)
-deploys hbbs, hbbr, sctgdesk-api-server, the web client and a bundled PostgreSQL.
+The Helm chart in [crabamole/rustdesk-charts](https://github.com/crabamole/rustdesk-charts)
+deploys hbbs, hbbr, rustdesk-api, the web client and a bundled PostgreSQL.
 See its README for installation and values.
 
 ### Docker
 
-Images are published to `ghcr.io/rophy/sctgdesk-server:<version>` (and `:latest`).
+Images are published to `ghcr.io/crabamole/rustdesk-server:<version>` (and `:latest`).
 The binaries are in `/usr/local/bin`; the working directory is
-`/usr/local/share/sctgdesk`, where hbbs keeps its keypair, so mount a volume there.
+`/usr/local/share/rustdesk-server`, where hbbs keeps its keypair, so mount a volume there.
 
 ```bash
 docker run -d --name hbbr \
   -p 21117:21117 -p 21119:21119 \
-  -v "$PWD/data:/usr/local/share/sctgdesk" \
-  ghcr.io/rophy/sctgdesk-server:latest hbbr
+  -v "$PWD/data:/usr/local/share/rustdesk-server" \
+  ghcr.io/crabamole/rustdesk-server:latest hbbr
 
 docker run -d --name hbbs \
   -p 21115:21115 -p 21116:21116 -p 21116:21116/udp -p 21118:21118 \
-  -v "$PWD/data:/usr/local/share/sctgdesk" \
+  -v "$PWD/data:/usr/local/share/rustdesk-server" \
   -e DB_URL=postgres://rustdesk:secret@db.example.com:5432/rustdesk \
   -e API_SERVER=http://api.example.com:21114 \
-  ghcr.io/rophy/sctgdesk-server:latest hbbs -r relay.example.com:21117
+  ghcr.io/crabamole/rustdesk-server:latest hbbs -r relay.example.com:21117
 ```
 
 ## Keypair
@@ -70,7 +70,7 @@ On first start hbbs writes `id_ed25519` / `id_ed25519.pub` to its working direct
 and logs the public key; clients need that key. To create a keypair yourself:
 
 ```bash
-docker run --rm --entrypoint /usr/local/bin/rustdesk-utils ghcr.io/rophy/sctgdesk-server:latest genkeypair
+docker run --rm --entrypoint /usr/local/bin/rustdesk-utils ghcr.io/crabamole/rustdesk-server:latest genkeypair
 ```
 
 ## Configuration
@@ -84,7 +84,7 @@ file in the working directory, or in an INI file passed with `-c`.
 | --- | --- | --- |
 | | `DB_URL` | **Required.** PostgreSQL URL, `postgres://user:pass@host:5432/db` |
 | | `MAX_DATABASE_CONNECTIONS` | Connection pool size (default `num_cpus * 4`). hbbs and the api-server each open a pool, so keep the total within Postgres `max_connections` |
-| | `API_SERVER` | sctgdesk-api-server URL used to validate tokens (default `http://127.0.0.1:21114`) |
+| | `API_SERVER` | rustdesk-api URL used to validate tokens (default `http://127.0.0.1:21114`) |
 | `--logged-in-only` | `LOGGED_IN_ONLY=Y` | Only logged-in clients may control peers |
 | | `ALWAYS_USE_RELAY=Y` | Disallow direct peer connections |
 | `-p, --port` | `PORT` | Rendezvous port (default `21116`) |
@@ -115,14 +115,14 @@ Requires a Rust toolchain.
 
 ```bash
 cargo build --release     # target/release/{hbbs,hbbr,rustdesk-utils}
-docker build -t sctgdesk-server .
+docker build -t rustdesk-server .
 ```
 
 To run hbbs locally against a throwaway PostgreSQL:
 
 ```bash
 docker run -d --name hbbs-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17-alpine
-# start sctgdesk-api-server with DATABASE_URL pointing at the same database first; it creates the schema
+# start rustdesk-api with DATABASE_URL pointing at the same database first; it creates the schema
 DB_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres ./target/release/hbbs
 ```
 

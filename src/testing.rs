@@ -17,7 +17,7 @@ const PEER_FIXTURE: &str = include_str!("../tests/fixtures/peer.sql");
 /// Includes the image tag: reuse matches by name, so bumping the tag below
 /// without also updating this name would silently keep reusing the old
 /// container image instead of the new one.
-const CONTAINER_NAME: &str = "sctgdesk-server-test-pg-17";
+const CONTAINER_NAME: &str = "rustdesk-server-test-pg-17";
 
 /// Databases older than this are considered stale and dropped on startup.
 const STALE_DATABASE_MAX_AGE_SECS: u64 = 60 * 60;

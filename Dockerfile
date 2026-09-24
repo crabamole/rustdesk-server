@@ -36,7 +36,7 @@ RUN --mount=type=tmpfs,target=/root/.cargo export TARGET=$(cat /build/_target) \
     mv /root/.cargo/config.tmp /root/.cargo/config.toml \
     && . /root/.cargo/env && cd /build \
     && if [ "$COVERAGE" = "true" ]; then \
-        export RUSTFLAGS="-C instrument-coverage --remap-path-prefix=/build=sctgdesk-server"; \
+        export RUSTFLAGS="-C instrument-coverage --remap-path-prefix=/build=rustdesk-server"; \
         FEATURES="coverage,vendored-openssl"; \
     else \
         FEATURES="vendored-openssl"; \
@@ -54,4 +54,4 @@ COPY --from=builder /build/output/hbbr /usr/local/bin/hbbr
 COPY --from=builder /build/output/rustdesk-utils /usr/local/bin/rustdesk-utils
 RUN if [ "$COVERAGE" = "true" ]; then mkdir -p /data/coverage; fi
 ENV LLVM_PROFILE_FILE=/data/coverage/%p-%m.profraw
-WORKDIR /usr/local/share/sctgdesk
+WORKDIR /usr/local/share/rustdesk-server

@@ -1,6 +1,6 @@
 [package]
 name = "hbbs"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["sctg <sctgdesk@k-cloud.pp.ua>", "rustdesk <info@rustdesk.com>"]
 edition = "2021"
 build = "build.rs"
