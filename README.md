@@ -13,8 +13,6 @@
 # SctgDesk Server Program
 
 ![Docker Pulls](https://img.shields.io/docker/pulls/sctg/sctgdesk-server)
-[![build](https://github.com/sctg-development/sctgdesk-server/actions/workflows/macos-intel-build.yml/badge.svg)](https://github.com/sctg-development/sctgdesk-server/actions/workflows/macos-intel-build.yml)
-[![build](https://github.com/sctg-development/sctgdesk-server/actions/workflows/windows.yml/badge.svg)](https://github.com/sctg-development/sctgdesk-server/actions/workflows/windows.yml)
 
 
 [**Binary Download**](https://github.com/sctg-development/sctgdesk-server/releases)  
@@ -289,8 +287,6 @@ export LOGGED_IN_ONLY=Y
 
 # RustDesk Server Program
 
-[![build](https://github.com/sctg-development/sctgdesk-server/actions/workflows/macos-intel-build.yml/badge.svg)](https://github.com/sctg-development/sctgdesk-server/actions/workflows/macos-intel-build.yml)
-[![build](https://github.com/sctg-development/sctgdesk-server/actions/workflows/windows.yml/badge.svg)](https://github.com/sctg-development/sctgdesk-server/actions/workflows/windows.yml)
 
 [**Download**](https://github.com/sctgdesk/sctgdesk-server/releases)
 
