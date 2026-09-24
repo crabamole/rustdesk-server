@@ -2,6 +2,7 @@
 set -e
 
 SERVICE=rustdesk-hbbs.service
+ENV_FILE=/etc/rustdesk-server/hbbs.env
 
 if [ "$1" = "configure" ]; then
     mkdir -p /var/log/rustdesk-server
@@ -10,73 +11,19 @@ fi
 case "$1" in
     configure|abort-upgrade|abort-deconfigure|abort-remove)
       mkdir -p /var/lib/rustdesk-server/
-	  # if /var/lib/rustdesk-server/oauth2.toml does not exist, create it
-	  if [ ! -f /var/lib/rustdesk-server/oauth2.toml ]; then
-		cat > /var/lib/rustdesk-server/oauth2.toml <<EOF
-# [[provider]]
-# provider = "Gitlab"
-# authorization_url = "https://gitlab.com/oauth/authorize"
-# token_exchange_url = "https://gitlab.com/oauth/token"
-# app_id = "your_gitlab_app_id"
-# app_secret = "your_gitlab_app_secret"
-# scope = "read_user"
-# op_auth_string = "oidc/gitlab"
-# op = "gitlab"
-
-# [[provider]]
-# provider = "Google"
-# authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
-# token_exchange_url = "https://oauth2.googleapis.com/token"
-# app_id = "your_google_app_id"
-# app_secret = "your_google_app_secret"
-# scope = "openid email profile"
-# op_auth_string = "oidc/google"
-# op = "google"
-
-# [[provider]]
-# provider = "Facebook"
-# authorization_url = "https://www.facebook.com/v13.0/dialog/oauth"
-# token_exchange_url = "https://graph.facebook.com/v13.0/oauth/access_token"
-# app_id = "your_facebook_app_id"
-# app_secret = "your_facebook_app_secret"
-# scope = "public_profile"
-# op_auth_string = "oidc/facebook"
-# op = "facebook"
-
-[[provider]]
-provider = "Github"
-authorization_url = "https://github.com/login/oauth/authorize"
-token_exchange_url = "https://github.com/login/oauth/access_token"
-app_id = "your_github_app_id"
-app_secret = "your_github_app_secret"
-scope = "read:user user:email"
-op_auth_string = "oidc/github"
-op = "github"
-
-[[provider]]
-provider = "Dex"
-authorization_url = "https://dex-mock-server.example.org/dex/auth"
-token_exchange_url = "https://dex-mock-server.example.org/dex/token"
-app_id = "sctgdesk-api-server"
-app_secret = "appsecret"
-op_auth_string = "oidc/dex"
-op = "dex"
-scope = "openid email profile"
-EOF
-	  fi
-	  if [ ! -f /var/lib/rustdesk-server/s3config.toml ]; then
-		cat > /var/lib/rustdesk-server/s3config.toml <<EOF
-[s3config]
-Endpoint = "https://compat.objectstorage.eu-london-1.oraclecloud.com"
-Region = "eu-london-1"
-AccessKey = "c324ead11faa0d87337c07ddc4a1129fab76188d"
-SecretKey = "GJurV55f/LD36kjZFpchZMj/uvgTqxHyFkBchUUa8KA="
-Bucket = "aezoz24elapn"
-Windows64Key = "master/sctgdesk-releases/sctgdesk-1.2.4-x86_64.exe"
-Windows32Key = "master/sctgdesk-releases/sctgdesk-1.2.4-i686.exe"
-OSXKey = "master/sctgdesk-releases/sctgdesk-1.2.4.dmg"
-OSXArm64Key = "master/sctgdesk-releases/sctgdesk-1.2.4.dmg"
-IOSKey = "master/sctgdesk-releases/sctgdesk-1.2.4.ipa"
+	  # hbbs needs a PostgreSQL database shared with sctgdesk-api-server.
+	  mkdir -p /etc/rustdesk-server
+	  if [ ! -f "${ENV_FILE}" ]; then
+		(umask 077; cat > "${ENV_FILE}") <<EOF
+# Environment for hbbs (rustdesk-hbbs.service).
+#
+# Required: the PostgreSQL database shared with sctgdesk-api-server. The
+# api-server creates the schema; hbbs waits until it exists.
+DB_URL=
+#
+# URL of sctgdesk-api-server, used to validate tokens when LOGGED_IN_ONLY=Y.
+#API_SERVER=http://127.0.0.1:21114
+#LOGGED_IN_ONLY=Y
 EOF
 	  fi
 	  deb-systemd-helper unmask "${SERVICE}" >/dev/null || true
@@ -86,7 +33,9 @@ EOF
 	  	deb-systemd-invoke update-state "${SERVICE}" >/dev/null || true
 	  fi
 	  systemctl --system daemon-reload >/dev/null || true
-	  if [ -n "$2" ]; then
+	  if ! grep -q '^DB_URL=..*' "${ENV_FILE}"; then
+		echo "rustdesk-hbbs: set DB_URL in ${ENV_FILE}, then run: systemctl restart ${SERVICE}"
+	  elif [ -n "$2" ]; then
 		deb-systemd-invoke restart "${SERVICE}" >/dev/null || true
 	  else
 		deb-systemd-invoke start "${SERVICE}" >/dev/null || true
