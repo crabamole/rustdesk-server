@@ -248,9 +248,8 @@ LimitNOFILE=1000000
 ExecStart=/usr/bin/hbbs --api-port=21113 -k AucFCOYVWNHRkJnx13FFh7C0tmUZ3nei5wXKmlfK6WPYthz65fRavaA5HO/OIz2kq+bCSlAqBkZgvikwVGqw/Q== --mask=10.10.0.235/24 -r rendez-vous.example.org -R rendez-vous.example.org
 #Environment="RUST_LOG=debug"
 Environment="ALWAYS_USE_RELAY=Y"
-Environment="OAUTH2_CREATE_USER=1"
-Environment="S3CONFIG_FILE=s3config.toml"
-Environment="OAUTH2_CONFIG_FILE=oauth2.toml"
+# DB_URL=postgres://... (required), API_SERVER, ...
+EnvironmentFile=/etc/rustdesk-server/hbbs.env
 WorkingDirectory=/var/lib/rustdesk-server/
 User=
 Group=
