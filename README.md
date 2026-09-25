@@ -54,14 +54,14 @@ The binaries are in `/usr/local/bin`; the working directory is
 docker run -d --name hbbr \
   -p 21117:21117 -p 21119:21119 \
   -v "$PWD/data:/usr/local/share/rustdesk-server" \
-  ghcr.io/crabamole/rustdesk-server:0.2.0 hbbr
+  ghcr.io/crabamole/rustdesk-server:1.1.16-1 hbbr
 
 docker run -d --name hbbs \
   -p 21115:21115 -p 21116:21116 -p 21116:21116/udp -p 21118:21118 \
   -v "$PWD/data:/usr/local/share/rustdesk-server" \
   -e DB_URL=postgres://rustdesk:secret@db.example.com:5432/rustdesk \
   -e API_SERVER=http://api.example.com:21114 \
-  ghcr.io/crabamole/rustdesk-server:0.2.0 hbbs -r relay.example.com:21117
+  ghcr.io/crabamole/rustdesk-server:1.1.16-1 hbbs -r relay.example.com:21117
 ```
 
 ## Keypair
@@ -70,7 +70,7 @@ On first start hbbs writes `id_ed25519` / `id_ed25519.pub` to its working direct
 and logs the public key; clients need that key. To create a keypair yourself:
 
 ```bash
-docker run --rm --entrypoint /usr/local/bin/rustdesk-utils ghcr.io/crabamole/rustdesk-server:0.2.0 genkeypair
+docker run --rm --entrypoint /usr/local/bin/rustdesk-utils ghcr.io/crabamole/rustdesk-server:1.1.16-1 genkeypair
 ```
 
 ## Configuration
