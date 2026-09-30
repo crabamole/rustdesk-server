@@ -1051,6 +1051,24 @@ impl RendezvousServer {
         Ok(())
     }
 
+    /// Registration moves the connection's sink into `ws_peers`, so the keep-alive goes there,
+    /// unless a newer connection of the same peer has replaced it. Clients echo the empty frame.
+    async fn send_keep_alive(&self, sink: &mut Option<Sink>, id: &str, gen: u64) -> bool {
+        async fn send_empty(sink: &mut Sink) -> bool {
+            match &mut sink.tx {
+                SinkType::TcpStream(s) => s.send(Bytes::new()).await.is_ok(),
+                SinkType::Ws(ws) => ws.send(tungstenite::Message::Binary(Vec::new())).await.is_ok(),
+            }
+        }
+        if let Some(s) = sink.as_mut() {
+            return send_empty(s).await;
+        }
+        match self.ws_peers.lock().await.get_mut(id) {
+            Some((stored_gen, s)) if *stored_gen == gen => send_empty(s).await,
+            _ => false,
+        }
+    }
+
     async fn send_to_ws_peer(&self, id: &str, msg: RendezvousMessage) -> bool {
         if let Some((_, sink)) = self.ws_peers.lock().await.get_mut(id) {
             if let Ok(mut bytes) = msg.write_to_bytes() {
@@ -1411,7 +1429,11 @@ impl RendezvousServer {
                 match timeout(read_timeout, b.next()).await {
                     Ok(Some(Ok(msg))) => {
                         if let tungstenite::Message::Binary(bytes) = msg {
-                            let (keep_going, info) = self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
+                            let (keep_going, info) = if bytes.is_empty() {
+                                (true, None) // keep-alive echo
+                            } else {
+                                self.handle_tcp(&bytes, &mut sink, addr, key, ws).await
+                            };
                             if let Some(info) = info {
                                 read_timeout = heartbeat_interval;
                                 reg_info = Some(info);
@@ -1429,17 +1451,14 @@ impl RendezvousServer {
                     }
                     Ok(Some(Err(_))) | Ok(None) => break,
                     Err(_) => {
-                        if let Some((ref id, _)) = reg_info {
+                        if let Some((ref id, gen)) = reg_info {
                             if let Some(peer) = self.pm.get_in_memory(id).await {
                                 let mut w = peer.write().await;
                                 w.last_reg_time = Instant::now();
                             }
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_register_peer_response(RegisterPeerResponse {
-                                request_pk: false,
-                                ..Default::default()
-                            });
-                            Self::send_to_sink(&mut sink, msg_out).await;
+                            if !self.send_keep_alive(&mut sink, id, gen).await {
+                                break;
+                            }
                         } else {
                             break;
                         }
@@ -1460,6 +1479,15 @@ impl RendezvousServer {
             loop {
                 match timeout(read_timeout, b.next()).await {
                     Ok(Some(Ok(mut bytes))) => {
+                        if bytes.is_empty() {
+                            // Keep-alive echo: never encrypted.
+                            if let Some((ref id, _)) = reg_info {
+                                if let Some(peer) = self.pm.get_in_memory(id).await {
+                                    peer.write().await.last_reg_time = Instant::now();
+                                }
+                            }
+                            continue;
+                        }
                         let mut enc_lock = enc.lock().await;
                         if enc_lock.is_some() {
                             if let Ok(dec) = enc_lock.as_mut().unwrap().dec(&bytes) {
@@ -1488,17 +1516,14 @@ impl RendezvousServer {
                     }
                     Ok(Some(Err(_))) | Ok(None) => break,
                     Err(_) => {
-                        if let Some((ref id, _)) = reg_info {
+                        if let Some((ref id, gen)) = reg_info {
                             if let Some(peer) = self.pm.get_in_memory(id).await {
                                 let mut w = peer.write().await;
                                 w.last_reg_time = Instant::now();
                             }
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_register_peer_response(RegisterPeerResponse {
-                                request_pk: false,
-                                ..Default::default()
-                            });
-                            Self::send_to_sink(&mut sink, msg_out).await;
+                            if !self.send_keep_alive(&mut sink, id, gen).await {
+                                break;
+                            }
                         } else {
                             break;
                         }
