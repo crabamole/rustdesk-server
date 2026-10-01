@@ -73,6 +73,14 @@ and logs the public key; clients need that key. To create a keypair yourself:
 docker run --rm --entrypoint /usr/local/bin/rustdesk-utils ghcr.io/crabamole/rustdesk-server:1.1.16-2 genkeypair
 ```
 
+Clients built from [crabamole/rustdesk](https://github.com/crabamole/rustdesk) trust only the
+`custom.txt` signing key given at build time (`RUSTDESK_CUSTOM_CLIENT_PK`). Use a separate keypair
+for it, keep its secret key offline, and sign a JSON config into `custom.txt`:
+
+```bash
+rustdesk-utils signcustom custom.json secret-key-file > custom.txt
+```
+
 ## Configuration
 
 Options can be given as command-line flags, as environment variables, in a `.env`

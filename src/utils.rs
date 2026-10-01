@@ -14,6 +14,7 @@ fn print_help() {
 Available Commands:
     genkeypair                                   Generate a new keypair
     validatekeypair [public key] [secret key]    Validate an existing keypair
+    signcustom [json file] [secret key file]     Sign a custom client config, print custom.txt
     doctor [rustdesk-server]                     Check for server connection problems"
     );
     process::exit(0x0001);
@@ -70,6 +71,20 @@ fn validate_keypair(pk: &str, sk: &str) -> ResultType<()> {
     }
 
     Ok(())
+}
+
+/// The client reads `custom.txt` as base64 of the signed JSON and ignores it if any step fails.
+fn sign_custom(json: &str, sk: &str) -> ResultType<String> {
+    if !serde_json::from_str::<serde_json::Value>(json).map_or(false, |v| v.is_object()) {
+        bail!("Custom client config must be a JSON object");
+    }
+    let Some(secret_key) = base64::decode(sk.trim())
+        .ok()
+        .and_then(|sk| sign::SecretKey::from_slice(&sk))
+    else {
+        bail!("Invalid secret key");
+    };
+    Ok(base64::encode(sign::sign(json.as_bytes(), &secret_key)))
 }
 
 fn doctor_tcp(address: std::net::IpAddr, port: &str, desc: &str) {
@@ -158,6 +173,22 @@ fn main() {
                 process::exit(0x0001);
             }
             println!("Key pair is VALID");
+        }
+        "signcustom" => {
+            if args.len() <= 3 {
+                error_then_help("You must supply the JSON file and the secret key file");
+            }
+            let res = std::fs::read_to_string(&args[2])
+                .and_then(|json| Ok((json, std::fs::read_to_string(&args[3])?)))
+                .map_err(Into::into)
+                .and_then(|(json, sk)| sign_custom(&json, &sk));
+            match res {
+                Ok(signed) => println!("{signed}"),
+                Err(e) => {
+                    println!("{e}");
+                    process::exit(0x0001);
+                }
+            }
         }
         "doctor" => {
             if args.len() <= 2 {
@@ -250,5 +281,44 @@ mod tests {
         let sk_b64 = base64::encode(sk);
         let result = validate_keypair("", &sk_b64);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sign_custom_verifies_like_the_client() {
+        let (pk, sk) = sign::gen_keypair();
+        let json = r#"{"conn-type": "incoming"}"#;
+        let signed = sign_custom(json, &base64::encode(sk)).unwrap();
+        // The client: decode64, sign::verify against its built-in key, parse the JSON.
+        let data = sign::verify(&base64::decode(signed).unwrap(), &pk).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["conn-type"], "incoming");
+    }
+
+    #[test]
+    fn test_sign_custom_rejected_by_other_key() {
+        let (_, sk) = sign::gen_keypair();
+        let (other_pk, _) = sign::gen_keypair();
+        let signed = sign_custom("{}", &base64::encode(sk)).unwrap();
+        assert!(sign::verify(&base64::decode(signed).unwrap(), &other_pk).is_err());
+    }
+
+    #[test]
+    fn test_sign_custom_trims_secret_key() {
+        let (_, sk) = sign::gen_keypair();
+        assert!(sign_custom("{}", &format!("{}\n", base64::encode(sk))).is_ok());
+    }
+
+    #[test]
+    fn test_sign_custom_rejects_non_object_json() {
+        let (_, sk) = sign::gen_keypair();
+        let sk_b64 = base64::encode(sk);
+        assert!(sign_custom("not json", &sk_b64).is_err());
+        assert!(sign_custom(r#"["conn-type"]"#, &sk_b64).is_err());
+    }
+
+    #[test]
+    fn test_sign_custom_rejects_invalid_secret_key() {
+        assert!(sign_custom("{}", "not-valid-base64!!!").is_err());
+        assert!(sign_custom("{}", &base64::encode(b"tooshort")).is_err());
     }
 }
