@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:experimental
+# syntax=docker/dockerfile:1
 FROM node:lts-bookworm AS builder
 ENV NODE_VERSION=20.18.0
 RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev zip git musl-dev musl-tools perl
@@ -24,16 +24,15 @@ COPY libs /build/libs
 COPY Cargo.toml /build/Cargo.toml
 COPY Cargo.lock /build/Cargo.lock
 COPY build.rs /build/build.rs
-RUN mv /root/.cargo /tmp && rm -rf /root/.cargo && mkdir -p /root/.cargo
 ARG COVERAGE=false
-RUN --mount=type=tmpfs,target=/root/.cargo export TARGET=$(cat /build/_target) \
-    && mkdir -p /root/.cargo \
-    && cp -av /tmp/.cargo/* /root/.cargo/ && ls -lR /root/.cargo \
-    && if [ ! -f /root/.cargo/config.toml ]; then \
-        echo "" > /root/.cargo/config.toml; \
-    fi && \
-    awk 'BEGIN{net_section=0;git_fetch_found=0;printed=0}/^\[net\]/{net_section=1;print;next}/^\[/{if(net_section&&!git_fetch_found){print "git-fetch-with-cli = true";printed=1}net_section=0;print;next}net_section&&/^git-fetch-with-cli\s*=/{print "git-fetch-with-cli = true";git_fetch_found=1;next}{print}END{if(!printed&&!git_fetch_found){if(!net_section)print "\n[net]";print "git-fetch-with-cli = true"}}' /root/.cargo/config.toml > /root/.cargo/config.tmp && \
-    mv /root/.cargo/config.tmp /root/.cargo/config.toml \
+# CI keeps 2 jobs; local builds can pass more.
+ARG CARGO_BUILD_JOBS=2
+# Cache mounts keep crate downloads and compiled dependencies between builds of this builder.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target \
+    export TARGET=$(cat /build/_target) \
+    && printf '[net]\ngit-fetch-with-cli = true\n' > /root/.cargo/config.toml \
     && . /root/.cargo/env && cd /build \
     && if [ "$COVERAGE" = "true" ]; then \
         export RUSTFLAGS="-C instrument-coverage --remap-path-prefix=/build=rustdesk-server"; \
@@ -41,11 +40,11 @@ RUN --mount=type=tmpfs,target=/root/.cargo export TARGET=$(cat /build/_target) \
     else \
         FEATURES="vendored-openssl"; \
     fi \
-    && cargo build --features $FEATURES --target=$TARGET --release -j2 \
+    && export CARGO_TARGET_DIR=/build/target/coverage-$COVERAGE \
+    && cargo build --features $FEATURES --target=$TARGET --release -j $CARGO_BUILD_JOBS \
     && mkdir -p /build/output \
-    && cp /build/target/$(cat /build/_target)/release/hbbr /build/output/ \
-    && cp /build/target/$(cat /build/_target)/release/hbbs /build/output/ \
-    && cp /build/target/$(cat /build/_target)/release/rustdesk-utils /build/output/
+    && cp $CARGO_TARGET_DIR/$TARGET/release/hbbr $CARGO_TARGET_DIR/$TARGET/release/hbbs \
+        $CARGO_TARGET_DIR/$TARGET/release/rustdesk-utils /build/output/
 
 FROM ubuntu:jammy
 ARG COVERAGE=false
