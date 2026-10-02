@@ -1143,7 +1143,7 @@ impl RendezvousServer {
             let counter = &mut old.0;
             if counter.1.elapsed().as_secs() > IP_BLOCK_DUR {
                 counter.0 = 0;
-            } else if counter.0 > *IP_BLOCK_PER_MINUTE as u32 {
+            } else if counter.0 > saturating_u32(*IP_BLOCK_PER_MINUTE) {
                 return false;
             }
             counter.0 += 1;

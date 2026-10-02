@@ -28,6 +28,11 @@ pub fn env_limit(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(default)
 }
 
+/// Convert usize to u32, saturating values above u32::MAX instead of truncating.
+pub fn saturating_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// The client address of a WebSocket handshake: `X-Real-IP`, else the nearest `X-Forwarded-For`
 /// entry not added by a trusted proxy, else the TCP peer. Headers count only from a trusted peer.
 pub fn resolve_client_addr(
@@ -488,5 +493,17 @@ mod tests {
         assert_eq!(env_limit("TEST_ENV_LIMIT_B", 30), 30);
         assert_eq!(env_limit("TEST_ENV_LIMIT_C", 30), 30);
         assert_eq!(env_limit("TEST_ENV_LIMIT_UNSET", 300), 300);
+    }
+
+    #[test]
+    fn saturating_u32_converts_within_range() {
+        assert_eq!(saturating_u32(30), 30);
+        assert_eq!(saturating_u32(u32::MAX as usize), u32::MAX);
+    }
+
+    #[test]
+    fn saturating_u32_saturates_above_max() {
+        assert_eq!(saturating_u32(u32::MAX as usize + 1), u32::MAX);
+        assert_eq!(saturating_u32(5_000_000_000), u32::MAX);
     }
 }
