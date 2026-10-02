@@ -23,6 +23,11 @@ pub fn trusted_proxies() -> &'static [ipnetwork::IpNetwork] {
     })
 }
 
+/// A positive number from the environment, else `default`.
+pub fn env_limit(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(default)
+}
+
 /// The client address of a WebSocket handshake: `X-Real-IP`, else the nearest `X-Forwarded-For`
 /// entry not added by a trusted proxy, else the TCP peer. Headers count only from a trusted peer.
 pub fn resolve_client_addr(
@@ -472,5 +477,16 @@ mod tests {
     fn resolve_handles_ipv6_and_mapped_peers() {
         let a = resolve_client_addr("[::ffff:10.244.1.2]:4000".parse().unwrap(), Some("2001:db8::7"), None, &nets(&["10.244.0.0/16"]));
         assert_eq!(a.ip().to_string(), "2001:db8::7");
+    }
+
+    #[test]
+    fn env_limit_reads_positive_numbers_only() {
+        std::env::set_var("TEST_ENV_LIMIT_A", "120");
+        std::env::set_var("TEST_ENV_LIMIT_B", "zero");
+        std::env::set_var("TEST_ENV_LIMIT_C", "0");
+        assert_eq!(env_limit("TEST_ENV_LIMIT_A", 30), 120);
+        assert_eq!(env_limit("TEST_ENV_LIMIT_B", 30), 30);
+        assert_eq!(env_limit("TEST_ENV_LIMIT_C", 30), 30);
+        assert_eq!(env_limit("TEST_ENV_LIMIT_UNSET", 300), 300);
     }
 }

@@ -110,6 +110,12 @@ static WS_HEARTBEAT_INTERVAL: once_cell::sync::Lazy<u64> = once_cell::sync::Lazy
         .unwrap_or(20_000)
 });
 
+// Defaults as upstream; raise them where several clients share an address.
+static IP_BLOCK_PER_MINUTE: once_cell::sync::Lazy<usize> =
+    once_cell::sync::Lazy::new(|| crate::common::env_limit("IP_BLOCK_PER_MINUTE", 30));
+static IP_BLOCK_IDS_PER_DAY: once_cell::sync::Lazy<usize> =
+    once_cell::sync::Lazy::new(|| crate::common::env_limit("IP_BLOCK_IDS_PER_DAY", 300));
+
 // Store punch hole requests
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex as TokioMutex; // differentiate if needed
@@ -1137,7 +1143,7 @@ impl RendezvousServer {
             let counter = &mut old.0;
             if counter.1.elapsed().as_secs() > IP_BLOCK_DUR {
                 counter.0 = 0;
-            } else if counter.0 > 30 {
+            } else if counter.0 > *IP_BLOCK_PER_MINUTE as u32 {
                 return false;
             }
             counter.0 += 1;
@@ -1147,7 +1153,7 @@ impl RendezvousServer {
             let is_new = counter.0.get(id).is_none();
             if counter.1.elapsed().as_secs() > DAY_SECONDS {
                 counter.0.clear();
-            } else if counter.0.len() > 300 {
+            } else if counter.0.len() > *IP_BLOCK_IDS_PER_DAY {
                 return !is_new;
             }
             if is_new {
