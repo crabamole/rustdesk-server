@@ -1404,18 +1404,13 @@ impl RendezvousServer {
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
-                let headers = req.headers();
-                let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
-                if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                    }
-                }
+                let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+                addr = crate::common::resolve_client_addr(
+                    addr,
+                    header("X-Real-IP"),
+                    header("X-Forwarded-For"),
+                    crate::common::trusted_proxies(),
+                );
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
