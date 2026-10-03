@@ -1902,6 +1902,28 @@ fn get_symetric_key_from_msg(
 mod tests {
     use super::*;
 
+    // API_SERVER and LOGGED_IN_ONLY are process-global: every test reaching
+    // admit_viewer (even with an empty token) must hold this, or a concurrent
+    // test setting LOGGED_IN_ONLY=Y can make it fail at random.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Holds ENV_LOCK for the guard's lifetime; clears both vars on drop so a
+    /// panicking assertion can't leak env state into the next test.
+    struct EnvGuard(tokio::sync::MutexGuard<'static, ()>);
+
+    impl EnvGuard {
+        async fn acquire() -> Self {
+            Self(ENV_LOCK.lock().await)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("API_SERVER");
+            std::env::remove_var("LOGGED_IN_ONLY");
+        }
+    }
+
     mod encrypt_tests {
         use super::*;
 
@@ -2575,6 +2597,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_empty_key_skips_license_check() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let ph = PunchHoleRequest {
                 id: "nonexistent".to_owned(),
@@ -2593,6 +2616,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_peer_not_found() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let ph = PunchHoleRequest {
                 id: "missing_peer".to_owned(),
@@ -2610,6 +2634,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_peer_offline() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             register_peer(&mut rs, "offline1", "10.0.0.2:5555").await;
 
@@ -2633,6 +2658,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_peer_online_returns_punch_hole() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             register_peer(&mut rs, "online1", "10.0.0.2:5555").await;
 
@@ -2650,6 +2676,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_same_ip_returns_fetch_local_addr() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             register_peer(&mut rs, "local_1", "10.0.0.2:5555").await;
 
@@ -2666,6 +2693,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_peer_ws_same_ip_still_punches() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             register_peer(&mut rs, "ws_peer1", "10.0.0.2:5555").await;
 
@@ -2934,6 +2962,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_always_use_relay_forces_symmetric() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "relay_target", "10.0.0.1:9999").await;
 
@@ -2958,6 +2987,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_punch_hole_with_lan_mask() {
+            let _guard = EnvGuard::acquire().await;
             let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
             let pm = PeerMap::new_with_db(db);
             let (tx, rx) = mpsc::unbounded_channel();
@@ -3000,6 +3030,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_punch_hole_cross_lan_forces_relay() {
+            let _guard = EnvGuard::acquire().await;
             let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
             let pm = PeerMap::new_with_db(db);
             let (tx, rx) = mpsc::unbounded_channel();
@@ -3047,6 +3078,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_punch_hole_ipv6_same_ip_returns_fetch_local_addr() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let peer_addr: SocketAddr = "[::1]:5555".parse().unwrap();
             let peer = rs.pm.get_or("ipv6_peer").await;
@@ -3077,6 +3109,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_punch_hole_ipv6_different_ip_returns_punch_hole() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let peer_addr: SocketAddr = "[::1]:5555".parse().unwrap();
             let peer = rs.pm.get_or("ipv6_peer2").await;
@@ -3309,6 +3342,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_handle_tcp_punch_hole_request_stores_sink() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
             let mut sink = None;
@@ -3326,6 +3360,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_handle_tcp_request_relay_no_peer() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
             let mut sink = None;
@@ -3344,6 +3379,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_handle_tcp_request_relay_with_peer() {
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, mut rx) = test_server().await;
             register_peer(&mut rs, "relay_tgt", "10.0.0.5:9000").await;
 
@@ -3495,9 +3531,6 @@ mod tests {
     mod logged_in_only_tests {
         use super::*;
 
-        // API_SERVER and LOGGED_IN_ONLY are process-global.
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
         /// Answers every request with `status` and `body`; returns the base URL.
         async fn api_stub(status: u16, body: &'static str) -> String {
             api_stub_routes((status, body), (status, body)).await
@@ -3544,11 +3577,6 @@ mod tests {
             }
         }
 
-        fn clear_env() {
-            std::env::remove_var("API_SERVER");
-            std::env::remove_var("LOGGED_IN_ONLY");
-        }
-
         fn punch(id: &str, token: &str) -> PunchHoleRequest {
             PunchHoleRequest {
                 id: id.to_owned(),
@@ -3583,14 +3611,13 @@ mod tests {
 
         #[tokio::test]
         async fn test_logged_in_only_empty_token_rejected() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "logged_peer", "10.0.0.5:5000").await;
 
             set_env(None, true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
             let (msg, _) = rs.handle_punch_hole_request(addr, punch("logged_peer", ""), "", false).await.unwrap();
-            clear_env();
 
             assert!(msg.has_punch_hole_response());
             assert!(
@@ -3600,14 +3627,13 @@ mod tests {
 
         #[tokio::test]
         async fn test_logged_in_only_with_token_tries_api() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "logged_peer2", "10.0.0.5:5000").await;
 
             set_env(Some(&closed_port_url().await), true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
             let result = rs.handle_punch_hole_request(addr, punch("logged_peer2", "fake-jwt-token"), "", false).await;
-            clear_env();
 
             let (msg, to) = result.unwrap();
             assert!(to.is_none());
@@ -3616,14 +3642,13 @@ mod tests {
 
         #[tokio::test]
         async fn test_punch_hole_carries_audit_ref() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "ref_peer", "10.0.0.5:5000").await;
 
             set_env(Some(&api_stub(200, r#"{"ref":"r1"}"#).await), false);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
             let (msg, to) = rs.handle_punch_hole_request(addr, punch("ref_peer", "tok"), "", false).await.unwrap();
-            clear_env();
 
             assert!(to.is_some());
             assert!(msg.has_punch_hole());
@@ -3632,7 +3657,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_fetch_local_addr_carries_audit_ref() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "ref_lan_peer", "10.0.0.5:5000").await;
 
@@ -3640,7 +3665,6 @@ mod tests {
             // Same IP as the target, so hbbs asks for local addresses instead of punching.
             let addr: SocketAddr = "10.0.0.5:1234".parse().unwrap();
             let (msg, to) = rs.handle_punch_hole_request(addr, punch("ref_lan_peer", "tok"), "", false).await.unwrap();
-            clear_env();
 
             assert!(to.is_some());
             assert!(msg.has_fetch_local_addr());
@@ -3649,14 +3673,13 @@ mod tests {
 
         #[tokio::test]
         async fn test_logged_in_only_rejected_token() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "rejected_peer", "10.0.0.5:5000").await;
 
             set_env(Some(&api_stub(401, "{}").await), true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
             let (msg, to) = rs.handle_punch_hole_request(addr, punch("rejected_peer", "tok"), "", false).await.unwrap();
-            clear_env();
 
             assert!(to.is_none());
             assert!(msg.punch_hole_response().other_failure.contains("session expired"));
@@ -3664,14 +3687,13 @@ mod tests {
 
         #[tokio::test]
         async fn test_attribution_is_best_effort() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "besteffort_peer", "10.0.0.5:5000").await;
 
             set_env(Some(&api_stub(500, "{}").await), false);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
             let (msg, to) = rs.handle_punch_hole_request(addr, punch("besteffort_peer", "tok"), "", false).await.unwrap();
-            clear_env();
 
             assert!(to.is_some());
             assert!(msg.has_punch_hole());
@@ -3680,21 +3702,20 @@ mod tests {
 
         #[tokio::test]
         async fn test_bad_audit_ref_reply_is_unavailable() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "badjson_peer", "10.0.0.5:5000").await;
 
             set_env(Some(&api_stub(200, "not json").await), true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
             let (msg, _) = rs.handle_punch_hole_request(addr, punch("badjson_peer", "tok"), "", false).await.unwrap();
-            clear_env();
 
             assert!(msg.punch_hole_response().other_failure.contains("session expired"));
         }
 
         #[tokio::test]
         async fn test_hung_api_server_times_out() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "hung_api_peer", "10.0.0.5:5000").await;
             // Accepts connections and never answers.
@@ -3714,7 +3735,6 @@ mod tests {
             let refused_in = started.elapsed();
             set_env(Some(&url), false);
             let allowed = rs.handle_punch_hole_request(addr, punch("hung_api_peer", "tok"), "", false).await.unwrap();
-            clear_env();
 
             assert!(refused_in < Duration::from_secs(3), "took {refused_in:?}");
             assert!(refused.0.punch_hole_response().other_failure.contains("session expired"));
@@ -3724,14 +3744,13 @@ mod tests {
 
         #[tokio::test]
         async fn test_older_api_server_falls_back_to_current_user() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "old_api_peer", "10.0.0.5:5000").await;
 
             set_env(Some(&api_stub_routes((404, "{}"), (200, r#"{"name":"u"}"#)).await), true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
             let (msg, to) = rs.handle_punch_hole_request(addr, punch("old_api_peer", "tok"), "", false).await.unwrap();
-            clear_env();
 
             assert!(to.is_some());
             assert!(msg.has_punch_hole());
@@ -3740,14 +3759,13 @@ mod tests {
 
         #[tokio::test]
         async fn test_older_api_server_rejects_token() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "old_api_peer2", "10.0.0.5:5000").await;
 
             set_env(Some(&api_stub_routes((404, "{}"), (401, "{}")).await), true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
             let (msg, to) = rs.handle_punch_hole_request(addr, punch("old_api_peer2", "tok"), "", false).await.unwrap();
-            clear_env();
 
             assert!(to.is_none());
             assert!(msg.punch_hole_response().other_failure.contains("session expired"));
@@ -3755,7 +3773,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_request_relay_refused_without_login() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, mut rx) = test_server_with_sk().await;
             register_peer(&mut rs, "relay_login_tgt", "10.0.0.5:9000").await;
             let (sink, mut client) = tcp_sink().await;
@@ -3764,7 +3782,6 @@ mod tests {
             set_env(None, true);
             let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
             let result = rs.handle_tcp(&relay_bytes("relay_login_tgt", ""), &mut sink, addr, "", false).await;
-            clear_env();
 
             assert!(result.0);
             assert!(rx.try_recv().is_err(), "nothing must reach the target");
@@ -3776,7 +3793,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_request_relay_forwards_audit_ref() {
-            let _g = ENV_LOCK.lock().await;
+            let _guard = EnvGuard::acquire().await;
             let (mut rs, mut rx) = test_server_with_sk().await;
             register_peer(&mut rs, "relay_ref_tgt", "10.0.0.5:9000").await;
             let mut sink = None;
@@ -3784,7 +3801,6 @@ mod tests {
             set_env(Some(&api_stub(200, r#"{"ref":"r2"}"#).await), true);
             let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
             let result = rs.handle_tcp(&relay_bytes("relay_ref_tgt", "tok"), &mut sink, addr, "", false).await;
-            clear_env();
 
             assert!(result.0);
             match rx.try_recv() {
