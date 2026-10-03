@@ -492,6 +492,20 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    match admit_viewer(&rf.token).await {
+                        Ok(r) => rf.controlled_context = controlled_context(&r),
+                        Err(reason) => {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_relay_response(RelayResponse {
+                                refuse_reason: reason.into(),
+                                ..Default::default()
+                            });
+                            allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                            return (true, None);
+                        }
+                    }
+                    // The target never needs the viewer's token.
+                    rf.token.clear();
                     let target_id = rf.id.clone();
                     if let Some(peer) = self.pm.get_in_memory(&target_id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -861,42 +875,17 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        // For limiting abuse, only allow logged in users to punch hole
-        // if LOGGED_IN_ONLY=Y is set in env or --logged-in-only is passed
-        if std::env::var("LOGGED_IN_ONLY")
-            .unwrap_or_default()
-            .to_uppercase()
-            == "Y"
-        {
-            let mut msg_out = RendezvousMessage::new();
-            if !ph.token.is_empty() {
-                let api_server = std::env::var("API_SERVER").unwrap_or_else(|_| "http://127.0.0.1:21114".to_string());
-                let api_url = api_server + "/api/currentUser";
-                let client = Client::new();
-                let res = client.post(&api_url)
-                    .bearer_auth(ph.token)
-                    .json(&json!({ "id": ph.id, "uuid": "uuid" }))
-                    .send()
-                    .await?;
-                if res.status().is_success() {
-                    let response_body: serde_json::Value = res.json().await?;
-                    log::debug!("Username: {}", response_body["name"]);
-                } else {
-                    log::debug!("Error: {}", res.status());
-                    msg_out.set_punch_hole_response(PunchHoleResponse {
-                        other_failure: String::from("The connection is not allowed. Your session expired."),
-                        ..Default::default()
-                    });
-                    return Ok((msg_out, None));
-                }
-            } else {
+        let audit_ref = match admit_viewer(&ph.token).await {
+            Ok(r) => r,
+            Err(reason) => {
+                let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
-                    other_failure: String::from("The connection is not allowed. You have not logged in."),
+                    other_failure: reason.into(),
                     ..Default::default()
                 });
                 return Ok((msg_out, None));
             }
-        }
+        };
         let id = ph.id;
         // punch hole request from A, relay to B,
         // check if in same intranet first,
@@ -963,6 +952,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    controlled_context: controlled_context(&audit_ref),
                     ..Default::default()
                 });
             } else {
@@ -976,6 +966,7 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    controlled_context: controlled_context(&audit_ref),
                     ..Default::default()
                 });
             }
@@ -1799,6 +1790,82 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+enum ViewerCheck {
+    /// Token accepted; the ref is empty when the api-server predates /api/audit/ref.
+    User(String),
+    Rejected,
+    Unavailable,
+}
+
+/// One api-server call per connection request validates the token and mints its audit ref.
+async fn check_viewer_token(token: &str) -> ViewerCheck {
+    let api_server = std::env::var("API_SERVER").unwrap_or_else(|_| "http://127.0.0.1:21114".to_string());
+    let client = Client::new();
+    let res = match client.post(format!("{api_server}/api/audit/ref")).bearer_auth(token).send().await {
+        Ok(res) => res,
+        Err(e) => {
+            log::warn!("api-server unreachable: {e}");
+            return ViewerCheck::Unavailable;
+        }
+    };
+    match res.status().as_u16() {
+        200 => match res.json::<serde_json::Value>().await {
+            Ok(v) => ViewerCheck::User(v["ref"].as_str().unwrap_or_default().to_owned()),
+            Err(e) => {
+                log::warn!("bad /api/audit/ref reply: {e}");
+                ViewerCheck::Unavailable
+            }
+        },
+        401 | 403 => ViewerCheck::Rejected,
+        404 => match client
+            .post(format!("{api_server}/api/currentUser"))
+            .bearer_auth(token)
+            .json(&json!({ "id": "", "uuid": "uuid" }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => ViewerCheck::User(String::new()),
+            Ok(_) => ViewerCheck::Rejected,
+            Err(e) => {
+                log::warn!("api-server unreachable: {e}");
+                ViewerCheck::Unavailable
+            }
+        },
+        status => {
+            log::warn!("/api/audit/ref answered {status}");
+            ViewerCheck::Unavailable
+        }
+    }
+}
+
+/// `Err(reason)` refuses the request; `Ok(ref)` is the audit ref to forward (may be empty).
+async fn admit_viewer(token: &str) -> Result<String, &'static str> {
+    let logged_in_only = std::env::var("LOGGED_IN_ONLY").unwrap_or_default().to_uppercase() == "Y";
+    if token.is_empty() {
+        return if logged_in_only {
+            Err("The connection is not allowed. You have not logged in.")
+        } else {
+            Ok(String::new())
+        };
+    }
+    match check_viewer_token(token).await {
+        ViewerCheck::User(r) => Ok(r),
+        _ if logged_in_only => Err("The connection is not allowed. Your session expired."),
+        _ => Ok(String::new()),
+    }
+}
+
+fn controlled_context(audit_ref: &str) -> MessageField<ControlledContext> {
+    if audit_ref.is_empty() {
+        MessageField::none()
+    } else {
+        MessageField::some(ControlledContext {
+            conn_audit_ref: audit_ref.to_owned(),
+            ..Default::default()
+        })
+    }
 }
 
 fn get_symetric_key_from_msg(
@@ -3417,22 +3484,102 @@ mod tests {
     mod logged_in_only_tests {
         use super::*;
 
+        // API_SERVER and LOGGED_IN_ONLY are process-global.
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        /// Answers every request with `status` and `body`; returns the base URL.
+        async fn api_stub(status: u16, body: &'static str) -> String {
+            api_stub_routes((status, body), (status, body)).await
+        }
+
+        /// Answers `/api/audit/ref` with `audit_ref` and every other path with `other`.
+        async fn api_stub_routes(
+            audit_ref: (u16, &'static str),
+            other: (u16, &'static str),
+        ) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let (mut s, _) = listener.accept().await.unwrap();
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first = req.lines().next().unwrap_or_default();
+                    let (status, body) = if first.contains("/api/audit/ref") { audit_ref } else { other };
+                    let resp = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    let _ = s.write_all(resp.as_bytes()).await;
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        async fn closed_port_url() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            format!("http://{addr}")
+        }
+
+        fn set_env(api_server: Option<&str>, logged_in_only: bool) {
+            match api_server {
+                Some(url) => std::env::set_var("API_SERVER", url),
+                None => std::env::remove_var("API_SERVER"),
+            }
+            if logged_in_only {
+                std::env::set_var("LOGGED_IN_ONLY", "Y");
+            } else {
+                std::env::remove_var("LOGGED_IN_ONLY");
+            }
+        }
+
+        fn clear_env() {
+            std::env::remove_var("API_SERVER");
+            std::env::remove_var("LOGGED_IN_ONLY");
+        }
+
+        fn punch(id: &str, token: &str) -> PunchHoleRequest {
+            PunchHoleRequest {
+                id: id.to_owned(),
+                token: token.to_owned(),
+                ..Default::default()
+            }
+        }
+
+        /// A sink whose frames can be read back from the returned stream.
+        async fn tcp_sink() -> (Sink, Framed<TcpStream, BytesCodec>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (tx, _) = Framed::new(server, BytesCodec::new()).split();
+            let sink = Sink {
+                tx: SinkType::TcpStream(tx),
+                key: Default::default(),
+            };
+            (sink, Framed::new(client, BytesCodec::new()))
+        }
+
+        fn relay_bytes(id: &str, token: &str) -> Vec<u8> {
+            let mut msg = RendezvousMessage::new();
+            msg.set_request_relay(RequestRelay {
+                id: id.to_owned(),
+                token: token.to_owned(),
+                uuid: "relay-uuid".to_owned(),
+                ..Default::default()
+            });
+            msg.write_to_bytes().unwrap()
+        }
+
         #[tokio::test]
         async fn test_logged_in_only_empty_token_rejected() {
+            let _g = ENV_LOCK.lock().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "logged_peer", "10.0.0.5:5000").await;
 
-            std::env::set_var("LOGGED_IN_ONLY", "Y");
-
-            let ph = PunchHoleRequest {
-                id: "logged_peer".to_owned(),
-                token: "".to_owned(),
-                ..Default::default()
-            };
+            set_env(None, true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
-            let (msg, _) = rs.handle_punch_hole_request(addr, ph, "", false).await.unwrap();
-
-            std::env::remove_var("LOGGED_IN_ONLY");
+            let (msg, _) = rs.handle_punch_hole_request(addr, punch("logged_peer", ""), "", false).await.unwrap();
+            clear_env();
 
             assert!(msg.has_punch_hole_response());
             assert!(
@@ -3442,25 +3589,171 @@ mod tests {
 
         #[tokio::test]
         async fn test_logged_in_only_with_token_tries_api() {
+            let _g = ENV_LOCK.lock().await;
             let (mut rs, _rx) = test_server_with_sk().await;
             register_peer(&mut rs, "logged_peer2", "10.0.0.5:5000").await;
 
-            std::env::set_var("LOGGED_IN_ONLY", "Y");
-
-            let ph = PunchHoleRequest {
-                id: "logged_peer2".to_owned(),
-                token: "fake-jwt-token".to_owned(),
-                ..Default::default()
-            };
+            set_env(Some(&closed_port_url().await), true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
-            // This will fail because API server isn't running, but exercises the code path
-            let result = rs.handle_punch_hole_request(addr, ph, "", false).await;
+            let result = rs.handle_punch_hole_request(addr, punch("logged_peer2", "fake-jwt-token"), "", false).await;
+            clear_env();
 
-            std::env::remove_var("LOGGED_IN_ONLY");
+            let (msg, to) = result.unwrap();
+            assert!(to.is_none());
+            assert!(msg.punch_hole_response().other_failure.contains("session expired"));
+        }
 
-            // Either an error (API not reachable) or a response is fine
-            match result {
-                Ok(_) | Err(_) => {}
+        #[tokio::test]
+        async fn test_punch_hole_carries_audit_ref() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "ref_peer", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub(200, r#"{"ref":"r1"}"#).await), false);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("ref_peer", "tok"), "", false).await.unwrap();
+            clear_env();
+
+            assert!(to.is_some());
+            assert!(msg.has_punch_hole());
+            assert_eq!(msg.punch_hole().controlled_context.conn_audit_ref, "r1");
+        }
+
+        #[tokio::test]
+        async fn test_fetch_local_addr_carries_audit_ref() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "ref_lan_peer", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub(200, r#"{"ref":"r1"}"#).await), true);
+            // Same IP as the target, so hbbs asks for local addresses instead of punching.
+            let addr: SocketAddr = "10.0.0.5:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("ref_lan_peer", "tok"), "", false).await.unwrap();
+            clear_env();
+
+            assert!(to.is_some());
+            assert!(msg.has_fetch_local_addr());
+            assert_eq!(msg.fetch_local_addr().controlled_context.conn_audit_ref, "r1");
+        }
+
+        #[tokio::test]
+        async fn test_logged_in_only_rejected_token() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "rejected_peer", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub(401, "{}").await), true);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("rejected_peer", "tok"), "", false).await.unwrap();
+            clear_env();
+
+            assert!(to.is_none());
+            assert!(msg.punch_hole_response().other_failure.contains("session expired"));
+        }
+
+        #[tokio::test]
+        async fn test_attribution_is_best_effort() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "besteffort_peer", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub(500, "{}").await), false);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("besteffort_peer", "tok"), "", false).await.unwrap();
+            clear_env();
+
+            assert!(to.is_some());
+            assert!(msg.has_punch_hole());
+            assert!(msg.punch_hole().controlled_context.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_bad_audit_ref_reply_is_unavailable() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "badjson_peer", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub(200, "not json").await), true);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, _) = rs.handle_punch_hole_request(addr, punch("badjson_peer", "tok"), "", false).await.unwrap();
+            clear_env();
+
+            assert!(msg.punch_hole_response().other_failure.contains("session expired"));
+        }
+
+        #[tokio::test]
+        async fn test_older_api_server_falls_back_to_current_user() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "old_api_peer", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub_routes((404, "{}"), (200, r#"{"name":"u"}"#)).await), true);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("old_api_peer", "tok"), "", false).await.unwrap();
+            clear_env();
+
+            assert!(to.is_some());
+            assert!(msg.has_punch_hole());
+            assert!(msg.punch_hole().controlled_context.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_older_api_server_rejects_token() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "old_api_peer2", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub_routes((404, "{}"), (401, "{}")).await), true);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("old_api_peer2", "tok"), "", false).await.unwrap();
+            clear_env();
+
+            assert!(to.is_none());
+            assert!(msg.punch_hole_response().other_failure.contains("session expired"));
+        }
+
+        #[tokio::test]
+        async fn test_request_relay_refused_without_login() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, mut rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "relay_login_tgt", "10.0.0.5:9000").await;
+            let (sink, mut client) = tcp_sink().await;
+            let mut sink = Some(sink);
+
+            set_env(None, true);
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let result = rs.handle_tcp(&relay_bytes("relay_login_tgt", ""), &mut sink, addr, "", false).await;
+            clear_env();
+
+            assert!(result.0);
+            assert!(rx.try_recv().is_err(), "nothing must reach the target");
+            let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
+            let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
+            assert!(reply.has_relay_response());
+            assert!(reply.relay_response().refuse_reason.contains("not logged in"));
+        }
+
+        #[tokio::test]
+        async fn test_request_relay_forwards_audit_ref() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, mut rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "relay_ref_tgt", "10.0.0.5:9000").await;
+            let mut sink = None;
+
+            set_env(Some(&api_stub(200, r#"{"ref":"r2"}"#).await), true);
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let result = rs.handle_tcp(&relay_bytes("relay_ref_tgt", "tok"), &mut sink, addr, "", false).await;
+            clear_env();
+
+            assert!(result.0);
+            match rx.try_recv() {
+                Ok(Data::Msg(msg, to)) => {
+                    assert_eq!(to, "10.0.0.5:9000".parse::<SocketAddr>().unwrap());
+                    let rr = msg.request_relay();
+                    assert_eq!(rr.controlled_context.conn_audit_ref, "r2");
+                    assert!(rr.token.is_empty());
+                }
+                _ => panic!("RequestRelay was not forwarded"),
             }
         }
     }
