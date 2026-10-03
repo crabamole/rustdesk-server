@@ -135,7 +135,13 @@ impl Database {
         pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
-        sqlx::query("UPDATE peer SET id=$1, pk=$2, info=$3 WHERE guid=$4")
+        // Merge hbbs's info (e.g. ip) into the stored JSON so the api-server's
+        // system info (hostname, os, cpu, ...) survives an address change.
+        sqlx::query(
+            "UPDATE peer SET id=$1, pk=$2, \
+             info = (COALESCE(NULLIF(info, ''), '{}')::jsonb || $3::jsonb)::text \
+             WHERE guid=$4",
+        )
             .bind(id)
             .bind(pk)
             .bind(info)
@@ -251,7 +257,42 @@ mod tests {
 
         let peer = db.get_peer("peer456").await.unwrap().unwrap();
         assert_eq!(peer.pk, new_pk.to_vec());
-        assert_eq!(peer.info, new_info);
+        // info now round-trips through jsonb (merge), so compare parsed value, not raw text.
+        let got: serde_json::Value = serde_json::from_str(&peer.info).unwrap();
+        let want: serde_json::Value = serde_json::from_str(new_info).unwrap();
+        assert_eq!(got, want);
+    });
+
+    db_test!(update_pk_merges_info_keeping_existing_keys, |db| {
+        let uuid = b"test-uuid-bytes!";
+        let pk = b"test-pk-bytes!!!";
+        let info = r#"{"hostname":"ws-1","ip":"10.0.0.1"}"#;
+
+        let guid = db.insert_peer("peer789", uuid, pk, info).await.unwrap();
+
+        let new_pk = b"new-pk-bytes!!!!!";
+        let new_info = r#"{"ip":"203.0.113.5"}"#;
+        db.update_pk(&guid, "peer789", new_pk, new_info).await.unwrap();
+
+        let peer = db.get_peer("peer789").await.unwrap().unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&peer.info).unwrap();
+        assert_eq!(merged["hostname"], "ws-1");
+        assert_eq!(merged["ip"], "203.0.113.5");
+    });
+
+    db_test!(update_pk_merges_info_when_existing_info_is_empty, |db| {
+        let uuid = b"test-uuid-bytes!";
+        let pk = b"test-pk-bytes!!!";
+
+        let guid = db.insert_peer("peer_empty_info", uuid, pk, "").await.unwrap();
+
+        let new_pk = b"new-pk-bytes!!!!!";
+        let new_info = r#"{"ip":"203.0.113.5"}"#;
+        db.update_pk(&guid, "peer_empty_info", new_pk, new_info).await.unwrap();
+
+        let peer = db.get_peer("peer_empty_info").await.unwrap().unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&peer.info).unwrap();
+        assert_eq!(merged, serde_json::json!({"ip":"203.0.113.5"}));
     });
 
     db_test!(insert_duplicate_id_fails, |db| {
