@@ -52,6 +52,7 @@ fn main() -> ResultType<()> {
     }
     let rmem = get_arg("rmem").parse::<usize>().unwrap_or(RMEM);
     let serial: i32 = get_arg("serial").parse().unwrap_or(0);
+    parse_trusted_proxies(&std::env::var("TRUSTED_PROXIES").unwrap_or_default()).map_err(hbb_common::anyhow::Error::msg)?;
     crate::common::check_software_update();
 
     #[cfg(all(unix, feature = "coverage"))]

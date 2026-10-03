@@ -28,6 +28,7 @@ fn main() -> ResultType<()> {
             section.iter().for_each(|(k, v)| std::env::set_var(k, v));
         }
     }
+    common::parse_trusted_proxies(&std::env::var("TRUSTED_PROXIES").unwrap_or_default()).map_err(hbb_common::anyhow::Error::msg)?;
     let mut port = RELAY_PORT;
     if let Ok(v) = std::env::var("PORT") {
         let v: i32 = v.parse().unwrap_or_default();
