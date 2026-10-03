@@ -33,8 +33,9 @@ The NAT test and WebSocket ports follow the main port: `PORT - 1` and `PORT + 2`
 - **PostgreSQL**, shared with rustdesk-api. The api-server owns the schema:
   start it first against the same database. hbbs never creates or migrates tables;
   at startup it waits until the schema exists.
-- **rustdesk-api**, reachable from hbbs when `LOGGED_IN_ONLY=Y` (set its URL
-  with `API_SERVER`).
+- **rustdesk-api**, reachable from hbbs (set its URL with `API_SERVER`). Required
+  when `LOGGED_IN_ONLY=Y`; also used, best effort, for any request carrying a
+  token so the connection can be attributed to the signed-in user.
 
 ## Deployment
 
