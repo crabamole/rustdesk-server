@@ -1792,6 +1792,10 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     Ok(s)
 }
 
+/// Bounds every api-server login check so a hung api-server cannot stall connection requests.
+const API_CHECK_TIMEOUT_MS: u64 = if cfg!(test) { 500 } else { 5_000 };
+static API_CLIENT: Lazy<Client> = Lazy::new(Client::new);
+
 enum ViewerCheck {
     /// Token accepted; the ref is empty when the api-server predates /api/audit/ref.
     User(String),
@@ -1802,7 +1806,7 @@ enum ViewerCheck {
 /// One api-server call per connection request validates the token and mints its audit ref.
 async fn check_viewer_token(token: &str) -> ViewerCheck {
     let api_server = std::env::var("API_SERVER").unwrap_or_else(|_| "http://127.0.0.1:21114".to_string());
-    let client = Client::new();
+    let client = &*API_CLIENT;
     let res = match client.post(format!("{api_server}/api/audit/ref")).bearer_auth(token).send().await {
         Ok(res) => res,
         Err(e) => {
@@ -1850,7 +1854,14 @@ async fn admit_viewer(token: &str) -> Result<String, &'static str> {
             Ok(String::new())
         };
     }
-    match check_viewer_token(token).await {
+    let check = match timeout(API_CHECK_TIMEOUT_MS, check_viewer_token(token)).await {
+        Ok(check) => check,
+        Err(_) => {
+            log::warn!("api-server did not answer within {API_CHECK_TIMEOUT_MS} ms");
+            ViewerCheck::Unavailable
+        }
+    };
+    match check {
         ViewerCheck::User(r) => Ok(r),
         _ if logged_in_only => Err("The connection is not allowed. Your session expired."),
         _ => Ok(String::new()),
@@ -3679,6 +3690,36 @@ mod tests {
             clear_env();
 
             assert!(msg.punch_hole_response().other_failure.contains("session expired"));
+        }
+
+        #[tokio::test]
+        async fn test_hung_api_server_times_out() {
+            let _g = ENV_LOCK.lock().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "hung_api_peer", "10.0.0.5:5000").await;
+            // Accepts connections and never answers.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((s, _)) = listener.accept().await {
+                    held.push(s);
+                }
+            });
+
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            set_env(Some(&url), true);
+            let started = Instant::now();
+            let refused = rs.handle_punch_hole_request(addr, punch("hung_api_peer", "tok"), "", false).await.unwrap();
+            let refused_in = started.elapsed();
+            set_env(Some(&url), false);
+            let allowed = rs.handle_punch_hole_request(addr, punch("hung_api_peer", "tok"), "", false).await.unwrap();
+            clear_env();
+
+            assert!(refused_in < Duration::from_secs(3), "took {refused_in:?}");
+            assert!(refused.0.punch_hole_response().other_failure.contains("session expired"));
+            assert!(allowed.1.is_some());
+            assert!(allowed.0.punch_hole().controlled_context.is_none());
         }
 
         #[tokio::test]
