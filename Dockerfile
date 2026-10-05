@@ -2,7 +2,8 @@
 FROM node:lts-bookworm AS builder
 ENV NODE_VERSION=20.18.0
 RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev zip git musl-dev musl-tools perl
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# e2e coverage tools must be able to read the profiles
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0 --profile minimal
 RUN echo $(dpkg --print-architecture)
 RUN mkdir /build
 RUN if [ "$(dpkg --print-architecture)" = "armhf" ]; then \
