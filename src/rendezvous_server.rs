@@ -492,7 +492,7 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    match admit_viewer(&rf.token).await {
+                    match admit_viewer(&rf.token, &rf.id).await {
                         Ok(r) => rf.controlled_context = controlled_context(&r),
                         Err(reason) => {
                             let mut msg_out = RendezvousMessage::new();
@@ -875,7 +875,7 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        let audit_ref = match admit_viewer(&ph.token).await {
+        let audit_ref = match admit_viewer(&ph.token, &ph.id).await {
             Ok(r) => r,
             Err(reason) => {
                 let mut msg_out = RendezvousMessage::new();
@@ -1803,11 +1803,12 @@ enum ViewerCheck {
     Unavailable,
 }
 
-/// One api-server call per connection request validates the token and mints its audit ref.
-async fn check_viewer_token(token: &str) -> ViewerCheck {
+/// One api-server call per connection request validates the token and mints its audit ref,
+/// bound to the device `target` the viewer connects to.
+async fn check_viewer_token(token: &str, target: &str) -> ViewerCheck {
     let api_server = std::env::var("API_SERVER").unwrap_or_else(|_| "http://127.0.0.1:21114".to_string());
     let client = &*API_CLIENT;
-    let res = match client.post(format!("{api_server}/api/audit/ref")).bearer_auth(token).send().await {
+    let res = match client.post(format!("{api_server}/api/audit/ref")).query(&[("target", target)]).bearer_auth(token).send().await {
         Ok(res) => res,
         Err(e) => {
             log::warn!("api-server unreachable: {e}");
@@ -1844,8 +1845,8 @@ async fn check_viewer_token(token: &str) -> ViewerCheck {
     }
 }
 
-/// `Err(reason)` refuses the request; `Ok(ref)` is the audit ref to forward (may be empty).
-async fn admit_viewer(token: &str) -> Result<String, &'static str> {
+/// `Err(reason)` refuses the request; `Ok(ref)` is the audit ref to forward to `target` (may be empty).
+async fn admit_viewer(token: &str, target: &str) -> Result<String, &'static str> {
     let logged_in_only = std::env::var("LOGGED_IN_ONLY").unwrap_or_default().to_uppercase() == "Y";
     if token.is_empty() {
         return if logged_in_only {
@@ -1854,7 +1855,7 @@ async fn admit_viewer(token: &str) -> Result<String, &'static str> {
             Ok(String::new())
         };
     }
-    let check = match timeout(API_CHECK_TIMEOUT_MS, check_viewer_token(token)).await {
+    let check = match timeout(API_CHECK_TIMEOUT_MS, check_viewer_token(token, target)).await {
         Ok(check) => check,
         Err(_) => {
             log::warn!("api-server did not answer within {API_CHECK_TIMEOUT_MS} ms");
@@ -3550,7 +3551,7 @@ mod tests {
                     let n = s.read(&mut buf).await.unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
                     let first = req.lines().next().unwrap_or_default();
-                    let (status, body) = if first.contains("/api/audit/ref") { audit_ref } else { other };
+                    let (status, body) = if first.contains("/api/audit/ref?target=") { audit_ref } else { other };
                     let resp = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                     let _ = s.write_all(resp.as_bytes()).await;
                 }
@@ -3653,6 +3654,32 @@ mod tests {
             assert!(to.is_some());
             assert!(msg.has_punch_hole());
             assert_eq!(msg.punch_hole().controlled_context.conn_audit_ref, "r1");
+        }
+
+        #[tokio::test]
+        async fn test_audit_ref_request_names_the_target_device() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "target_peer", "10.0.0.5:5000").await;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, mut lines) = mpsc::unbounded_channel::<String>();
+            tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or_default().to_owned());
+                let body = r#"{"ref":"r9"}"#;
+                let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+            set_env(Some(&url), false);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, _) = rs.handle_punch_hole_request(addr, punch("target_peer", "tok"), "", false).await.unwrap();
+
+            assert_eq!(msg.punch_hole().controlled_context.conn_audit_ref, "r9");
+            assert!(lines.recv().await.unwrap().starts_with("POST /api/audit/ref?target=target_peer "));
         }
 
         #[tokio::test]
