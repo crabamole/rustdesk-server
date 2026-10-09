@@ -27,6 +27,7 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use std::sync::{atomic::AtomicBool, Arc};
 
 type Usage = (usize, usize, usize, usize);
 
@@ -44,6 +45,8 @@ static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // i
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
+const HEALTH_PORT: u16 = 21122;
+const LIVENESS_TIMEOUT: Duration = Duration::from_millis(crate::health::PROBE_TIMEOUT_MS);
 
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start(port: &str, key: &str) -> ResultType<()> {
@@ -82,17 +85,65 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
+    let health_port = health_port();
+    log::info!("Listening on health :{}", health_port);
+    let health_listener = crate::health::bind(health_port)?;
+    let (health, mut pings) = Health::new();
     let main_task = async move {
         loop {
             log::info!("Start");
-            io_loop(listen_any(port).await?, listen_any(port2).await?, &key).await;
+            io_loop(listen_any(port).await?, listen_any(port2).await?, &key, &mut pings).await;
         }
     };
+    let health_task = crate::health::serve(health_listener, health);
     let listen_signal = crate::common::listen_signal();
     tokio::select!(
         res = main_task => res,
+        res = health_task => res,
         res = listen_signal => res,
     )
+}
+
+fn health_port() -> u16 {
+    std::env::var("HEALTH_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(HEALTH_PORT)
+}
+
+type Ping = tokio::sync::oneshot::Sender<()>;
+
+struct Health {
+    draining: AtomicBool,
+    ping: tokio::sync::mpsc::Sender<Ping>,
+}
+
+impl Health {
+    fn new() -> (Arc<Self>, tokio::sync::mpsc::Receiver<Ping>) {
+        let (ping, pings) = tokio::sync::mpsc::channel(16);
+        let health = Self {
+            draining: AtomicBool::new(false),
+            ping,
+        };
+        (Arc::new(health), pings)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::health::Probe for Health {
+    /// True when `io_loop` answers a ping in time.
+    async fn live(&self) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let answered = async { self.ping.send(tx).await.is_ok() && rx.await.is_ok() };
+        tokio::time::timeout(LIVENESS_TIMEOUT, answered)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// `serve` already requires `live()` for `/readyz`.
+    async fn ready(&self) -> bool {
+        !self.draining.load(Ordering::SeqCst)
+    }
 }
 
 fn check_params() {
@@ -323,11 +374,19 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
     res
 }
 
-async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
+async fn io_loop(
+    listener: TcpListener,
+    listener2: TcpListener,
+    key: &str,
+    pings: &mut tokio::sync::mpsc::Receiver<Ping>,
+) {
     check_params();
     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
     loop {
         tokio::select! {
+            Some(ping) = pings.recv() => {
+                ping.send(()).ok();
+            }
             res = listener.accept() => {
                 match res {
                     Ok((stream, addr))  => {
@@ -650,6 +709,8 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
 pub struct TestRelayServer {
     pub port: u16,
     pub ws_port: u16,
+    pub health_port: u16,
+    health: Arc<Health>,
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -659,19 +720,29 @@ impl TestRelayServer {
         let _ = self.shutdown.send(());
     }
 
+    /// What SIGTERM does to `/readyz`, without exiting.
+    pub fn start_draining(&self) {
+        self.health.draining.store(true, Ordering::SeqCst);
+    }
+
     pub async fn start(key: &str) -> hbb_common::ResultType<Self> {
         let key = get_server_sk(key);
         let listener = hbb_common::tcp::listen_any(0).await?;
         let port = listener.local_addr()?.port();
         let listener2 = hbb_common::tcp::listen_any(0).await?;
         let ws_port = listener2.local_addr()?.port();
+        let health_listener = crate::health::bind(0)?;
+        let health_port = health_listener.local_addr()?.port();
+        let (health, mut pings) = Health::new();
+        let health_task = crate::health::serve(health_listener, health.clone());
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let key = key.to_owned();
 
         tokio::spawn(async move {
             tokio::select! {
-                _ = io_loop(listener, listener2, &key) => {}
+                _ = io_loop(listener, listener2, &key, &mut pings) => {}
+                _ = health_task => {}
                 _ = &mut shutdown_rx => {}
             }
         });
@@ -679,6 +750,8 @@ impl TestRelayServer {
         Ok(TestRelayServer {
             port,
             ws_port,
+            health_port,
+            health,
             shutdown: shutdown_tx,
         })
     }
@@ -903,6 +976,62 @@ mod tests {
         std::env::remove_var("LIMIT_SPEED");
         std::env::remove_var("TOTAL_BANDWIDTH");
         std::env::remove_var("SINGLE_BANDWIDTH");
+    }
+
+    mod health_tests {
+        use super::*;
+        use crate::health::Probe as _;
+
+        fn answering() -> Arc<Health> {
+            let (health, mut pings) = Health::new();
+            tokio::spawn(async move {
+                while let Some(ping) = pings.recv().await {
+                    ping.send(()).ok();
+                }
+            });
+            health
+        }
+
+        #[tokio::test]
+        async fn live_and_ready_while_the_loop_answers() {
+            let health = answering();
+            assert!(health.live().await);
+            assert!(health.ready().await);
+        }
+
+        #[tokio::test]
+        async fn not_live_when_the_loop_is_gone() {
+            let (health, pings) = Health::new();
+            drop(pings);
+            assert!(!health.live().await);
+        }
+
+        #[tokio::test]
+        async fn not_live_when_the_loop_does_not_answer() {
+            let (health, _pings) = Health::new();
+            let start = std::time::Instant::now();
+            assert!(!health.live().await);
+            assert!(start.elapsed() >= LIVENESS_TIMEOUT);
+        }
+
+        #[tokio::test]
+        async fn live_but_not_ready_while_draining() {
+            let health = answering();
+            health.draining.store(true, Ordering::SeqCst);
+            assert!(health.live().await);
+            assert!(!health.ready().await);
+        }
+
+        #[test]
+        fn health_port_reads_env() {
+            std::env::remove_var("HEALTH_PORT");
+            assert_eq!(health_port(), 21122);
+            std::env::set_var("HEALTH_PORT", "23122");
+            assert_eq!(health_port(), 23122);
+            std::env::set_var("HEALTH_PORT", "not-a-port");
+            assert_eq!(health_port(), 21122);
+            std::env::remove_var("HEALTH_PORT");
+        }
     }
 
     mod check_cmd_extra_tests {

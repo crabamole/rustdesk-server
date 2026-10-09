@@ -359,3 +359,65 @@ async fn test_relay_non_relay_message_ignored() {
 
     server.shutdown();
 }
+
+async fn health_status(port: u16, path: &str) -> u16 {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{port}{path}"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn test_health_live_and_ready() {
+    let server = TestRelayServer::start("").await.expect("start relay");
+    assert_eq!(health_status(server.health_port, "/livez").await, 200);
+    assert_eq!(health_status(server.health_port, "/readyz").await, 200);
+    server.shutdown();
+}
+
+/// nginx forwards `/ws/relay/<n>` to pod n unchanged; hbbr must pair on any path.
+#[tokio::test]
+async fn test_relay_pairs_on_any_ws_path() {
+    let server = TestRelayServer::start("").await.expect("start relay");
+    let ws_port = server.ws_port;
+    let connect = |path: &'static str| async move {
+        let stream = hbb_common::tokio::net::TcpStream::connect(format!("127.0.0.1:{ws_port}"))
+            .await
+            .unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(format!("ws://127.0.0.1:{ws_port}{path}"), stream)
+            .await
+            .unwrap();
+        ws
+    };
+    let mut req = RendezvousMessage::new();
+    req.set_request_relay(RequestRelay {
+        uuid: "test-any-path-uuid".to_owned(),
+        ..Default::default()
+    });
+    let req = req.write_to_bytes().unwrap();
+    let mut ws_a = connect("/ws/relay/3").await;
+    ws_a.send(tungstenite::Message::Binary(req.clone())).await.unwrap();
+    hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut ws_b = connect("/ws/relay").await;
+    ws_b.send(tungstenite::Message::Binary(req)).await.unwrap();
+    hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
+    ws_a.send(tungstenite::Message::Binary(b"via /ws/relay/3".to_vec())).await.unwrap();
+    let received = timeout(Duration::from_secs(3), ws_b.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(received, tungstenite::Message::Binary(b"via /ws/relay/3".to_vec()));
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn test_draining_fails_readyz_only() {
+    let server = TestRelayServer::start("").await.expect("start relay");
+    server.start_draining();
+    assert_eq!(health_status(server.health_port, "/livez").await, 200);
+    assert_eq!(health_status(server.health_port, "/readyz").await, 503);
+    server.shutdown();
+}
