@@ -48,10 +48,6 @@ impl Presence {
         }
     }
 
-    pub(crate) fn pod(&self) -> &str {
-        &self.pod
-    }
-
     pub(crate) fn epoch(&self) -> &str {
         &self.epoch
     }
