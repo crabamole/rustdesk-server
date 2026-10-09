@@ -4,7 +4,13 @@ use once_cell::sync::Lazy;
 use std::time::Duration;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-static CLIENT: Lazy<reqwest::Client> = Lazy::new(reqwest::Client::new);
+// Checks target in-cluster services; an egress proxy from the environment cannot reach them.
+static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder().no_proxy().build().unwrap_or_else(|e| {
+        hbb_common::log::warn!("relay check client without no_proxy: {e}");
+        reqwest::Client::new()
+    })
+});
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RelayList {
