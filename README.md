@@ -124,7 +124,7 @@ file in the working directory, or in an INI file passed with `-c`.
 | | `DOWNGRADE_THRESHOLD` | Threshold of the downgrade check (bit/ms) |
 | | `DOWNGRADE_START_CHECK` | Delay before the downgrade check (seconds) |
 
-On SIGTERM hbbr fails `/readyz` and keeps accepting and relaying; it exits once no session is open or waiting for its pair, at the earliest 10 s after the signal. SIGINT and SIGQUIT exit at once. Give the pod a termination grace period long enough for sessions to end.
+On SIGTERM hbbr fails `/readyz` and keeps accepting and relaying; it exits once no session is open or waiting for its pair, at the earliest 10 s after the signal. SIGINT and SIGQUIT exit at once, also while draining. A connection that does not finish the WebSocket upgrade within 30 s is dropped. Give the pod a termination grace period long enough for sessions to end.
 
 Both binaries honour `RUST_LOG` (`error`, `warn`, `info`, `debug`, `trace`).
 

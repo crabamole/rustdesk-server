@@ -149,3 +149,27 @@ async fn test_sigint_exits_at_once() {
         .expect("SIGINT does not drain");
     assert!(exit.success(), "exit status {exit:?}");
 }
+
+#[tokio::test]
+async fn test_sigquit_exits_at_once() {
+    let mut hbbr = start_hbbr().await;
+    let _open = pair(hbbr.ws_port, "sigquit-open-session").await;
+    signal(&hbbr.child, "QUIT");
+    let exit = wait_for_exit(&mut hbbr.child, Duration::from_secs(3))
+        .await
+        .expect("SIGQUIT does not drain");
+    assert!(exit.success(), "exit status {exit:?}");
+}
+
+#[tokio::test]
+async fn test_sigint_while_draining_exits_at_once() {
+    let mut hbbr = start_hbbr().await;
+    let _open = pair(hbbr.ws_port, "sigint-while-draining").await;
+    signal(&hbbr.child, "TERM");
+    assert!(wait_for_status(hbbr.health_port, "/readyz", 503, Duration::from_secs(2)).await);
+    signal(&hbbr.child, "INT");
+    let exit = wait_for_exit(&mut hbbr.child, Duration::from_secs(3))
+        .await
+        .expect("SIGINT ends a drain");
+    assert!(exit.success(), "exit status {exit:?}");
+}

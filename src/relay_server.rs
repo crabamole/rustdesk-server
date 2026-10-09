@@ -48,6 +48,8 @@ const BLOCKLIST_FILE: &str = "blocklist.txt";
 const HEALTH_PORT: u16 = 21122;
 const LIVENESS_TIMEOUT: Duration = Duration::from_millis(crate::health::PROBE_TIMEOUT_MS);
 // hbbs polls /readyz every 3 s and clients dial a handed-out URL shortly after.
+// A connection that never completes the upgrade must not hold a drain open.
+const WS_HANDSHAKE_MS: u64 = 30_000;
 const DRAIN_MIN: Duration = Duration::from_secs(10);
 
 #[tokio::main(flavor = "multi_thread")]
@@ -99,12 +101,7 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
         }
     };
     let health_task = crate::health::serve(health_listener, health.clone());
-    let shutdown = async {
-        if shutdown_signal().await? {
-            health.drain(DRAIN_MIN).await;
-        }
-        Ok(())
-    };
+    let shutdown = shutdown_signal(&health);
     tokio::select!(
         res = main_task => res,
         res = health_task => res,
@@ -186,22 +183,30 @@ impl crate::health::Probe for Health {
     }
 }
 
-/// Ok(true) on SIGTERM, which drains; Ok(false) on SIGINT or SIGQUIT, which exit at once.
+/// SIGTERM drains; SIGINT and SIGQUIT exit at once, also while draining.
 #[cfg(unix)]
-async fn shutdown_signal() -> ResultType<bool> {
+async fn shutdown_signal(health: &Health) -> ResultType<()> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut quit = signal(SignalKind::quit())?;
-    Ok(tokio::select! {
-        _ = term.recv() => { log::info!("signal terminate"); true }
-        _ = int.recv() => { log::info!("signal interrupt"); false }
-        _ = quit.recv() => { log::info!("signal quit"); false }
-    })
+    tokio::select! {
+        _ = term.recv() => {
+            log::info!("signal terminate");
+            tokio::select! {
+                _ = health.drain(DRAIN_MIN) => {}
+                _ = int.recv() => log::info!("signal interrupt"),
+                _ = quit.recv() => log::info!("signal quit"),
+            }
+        }
+        _ = int.recv() => log::info!("signal interrupt"),
+        _ = quit.recv() => log::info!("signal quit"),
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() -> ResultType<bool> {
+async fn shutdown_signal(_health: &Health) -> ResultType<()> {
     std::future::pending().await
 }
 
@@ -507,7 +512,7 @@ async fn handle_connection(
     let limiter = limiter.clone();
     let session = health.session();
     tokio::spawn(async move {
-        allow_err!(make_pair(stream, addr, &key, limiter, ws, session).await);
+        allow_err!(make_pair(stream, addr, &key, limiter, ws, session, WS_HANDSHAKE_MS).await);
     });
 }
 
@@ -518,6 +523,7 @@ async fn make_pair(
     limiter: Limiter,
     ws: bool,
     session: Session,
+    handshake_ms: u64,
 ) -> ResultType<()> {
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -531,7 +537,7 @@ async fn make_pair(
             );
             Ok(response)
         };
-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+        let ws_stream = timeout(handshake_ms, tokio_tungstenite::accept_hdr_async(stream, callback)).await??;
         make_pair_(ws_stream, addr, key, limiter, session).await;
     } else {
         make_pair_(FramedStream::from(stream, addr), addr, key, limiter, session).await;
@@ -1107,6 +1113,22 @@ mod tests {
             std::env::set_var("HEALTH_PORT", "not-a-port");
             assert_eq!(health_port(), 21122);
             std::env::remove_var("HEALTH_PORT");
+        }
+
+        #[tokio::test]
+        async fn silent_ws_connection_times_out_the_handshake() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let idle = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (stream, addr) = listener.accept().await.unwrap();
+            let (health, _pings) = Health::new();
+            let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+            let start = std::time::Instant::now();
+            let res = make_pair(stream, addr, "", limiter, true, health.session(), 100).await;
+            assert!(res.is_err());
+            assert!(start.elapsed() < Duration::from_secs(5));
+            drop(idle);
         }
 
         #[tokio::test]
