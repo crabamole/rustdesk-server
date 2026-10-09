@@ -216,7 +216,7 @@ impl Cluster {
                     log::debug!("viewer {addr} no longer waits on {}", pod.pod);
                 }
             }
-            None => log::warn!("no live hbbs pod with ordinal {ordinal} for viewer {addr}"),
+            None => log::debug!("no live hbbs pod with ordinal {ordinal} for viewer {addr}"),
         }
         true
     }
