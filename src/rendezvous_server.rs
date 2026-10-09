@@ -2020,6 +2020,9 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
 /// Bounds every api-server login check so a hung api-server cannot stall connection requests.
 const API_CHECK_TIMEOUT_MS: u64 = if cfg!(test) { 500 } else { 5_000 };
 static API_CLIENT: Lazy<Client> = Lazy::new(Client::new);
+/// Opens a new connection per request: a stopping api-server pod closes every pooled one at once.
+static API_RETRY_CLIENT: Lazy<Client> =
+    Lazy::new(|| Client::builder().pool_max_idle_per_host(0).build().unwrap_or_else(|_| Client::new()));
 
 enum ViewerCheck {
     /// Token accepted; the ref is empty when the api-server predates /api/audit/ref.
@@ -2033,7 +2036,16 @@ enum ViewerCheck {
 async fn check_viewer_token(token: &str, target: &str) -> ViewerCheck {
     let api_server = std::env::var("API_SERVER").unwrap_or_else(|_| "http://127.0.0.1:21114".to_string());
     let client = &*API_CLIENT;
-    let res = match client.post(format!("{api_server}/api/audit/ref")).query(&[("target", target)]).bearer_auth(token).send().await {
+    let send = |client: &Client| client.post(format!("{api_server}/api/audit/ref")).query(&[("target", target)]).bearer_auth(token).send();
+    // A stopping api-server pod closes its pooled connections, racing a request sent on one; a new one reaches a live pod.
+    let res = match send(client).await {
+        Err(e) => {
+            log::info!("retrying /api/audit/ref: {e}");
+            send(&API_RETRY_CLIENT).await
+        }
+        res => res,
+    };
+    let res = match res {
         Ok(res) => res,
         Err(e) => {
             log::warn!("api-server unreachable: {e}");
@@ -3988,6 +4000,40 @@ mod tests {
 
             assert_eq!(msg.punch_hole().controlled_context.conn_audit_ref, "r9");
             assert!(lines.recv().await.unwrap().starts_with("POST /api/audit/ref?target=target_peer "));
+        }
+
+        #[tokio::test]
+        async fn test_audit_ref_survives_pooled_connections_closed_by_the_server() {
+            let _guard = EnvGuard::acquire().await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            // The first two connections answer once, then drop their next request, as a stopping api-server pod does.
+            tokio::spawn(async move {
+                let both_open = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+                for n in 0.. {
+                    let (mut s, _) = listener.accept().await.unwrap();
+                    let both_open = both_open.clone();
+                    tokio::spawn(async move {
+                        let body = r#"{"ref":"r1"}"#;
+                        let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                        let mut buf = [0u8; 4096];
+                        let _ = s.read(&mut buf).await;
+                        if n < 2 {
+                            both_open.wait().await;
+                        }
+                        let _ = s.write_all(resp.as_bytes()).await;
+                        let _ = s.read(&mut buf).await;
+                        if n >= 2 {
+                            let _ = s.write_all(resp.as_bytes()).await;
+                        }
+                    });
+                }
+            });
+            set_env(Some(&url), true);
+
+            let (a, b) = tokio::join!(admit_viewer("tok", "dev"), admit_viewer("tok", "dev"));
+            assert_eq!((a, b), (Ok("r1".to_owned()), Ok("r1".to_owned())));
+            assert_eq!(admit_viewer("tok", "dev").await, Ok("r1".to_owned()));
         }
 
         #[tokio::test]
