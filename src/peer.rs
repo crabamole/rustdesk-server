@@ -57,6 +57,22 @@ impl Default for Peer {
     }
 }
 
+impl Peer {
+    fn from_db(row: database::Peer) -> Self {
+        let mut peer = Self::default();
+        peer.refresh(row);
+        peer
+    }
+
+    /// Takes the stored identity; liveness and rate-limit state stay.
+    fn refresh(&mut self, row: database::Peer) {
+        self.guid = row.guid;
+        self.uuid = row.uuid.into();
+        self.pk = row.pk.into();
+        self.info = serde_json::from_str::<PeerInfo>(&row.info).unwrap_or_default();
+    }
+}
+
 pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 
 #[derive(Clone)]
@@ -122,48 +138,45 @@ impl PeerMap {
         register_pk_response::Result::OK
     }
 
+    /// The stored row, merged into this pod's live entry when it holds the device.
+    /// Read on every call: another pod may have changed the key.
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
-        let p = self.map.read().await.get(id).cloned();
-        if p.is_some() {
-            return p;
-        }
-        let db_peer = match self.db.get_peer(id).await {
-            Ok(v) => v,
+        let row = match self.db.get_peer(id).await {
+            Ok(row) => row,
             Err(err) => {
                 log::error!("get_peer({id}) failed: {err}");
-                return None;
+                return self.get_in_memory(id).await;
             }
         };
-        if let Some(v) = db_peer {
-            let peer = Peer {
-                guid: v.guid,
-                uuid: v.uuid.into(),
-                pk: v.pk.into(),
-                // user: v.user,
-                info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
-                // disabled: v.status == Some(0),
-                ..Default::default()
-            };
-            let peer = Arc::new(RwLock::new(peer));
-            self.map.write().await.insert(id.to_owned(), peer.clone());
-            return Some(peer);
+        let live = self.get_in_memory(id).await;
+        match (row, live) {
+            (Some(row), Some(live)) => {
+                live.write().await.refresh(row);
+                Some(live)
+            }
+            (Some(row), None) => Some(Arc::new(RwLock::new(Peer::from_db(row)))),
+            (None, live) => live,
         }
-        None
     }
 
     #[inline]
     pub(crate) async fn get_or(&self, id: &str) -> LockPeer {
-        if let Some(p) = self.get(id).await {
-            return p;
-        }
+        let fresh = self.get(id).await;
         let mut w = self.map.write().await;
         if let Some(p) = w.get(id) {
             return p.clone();
         }
-        let tmp = LockPeer::default();
-        w.insert(id.to_owned(), tmp.clone());
-        tmp
+        let p = fresh.unwrap_or_default();
+        w.insert(id.to_owned(), p.clone());
+        p
+    }
+
+    /// The device left this pod; its rate-limit state stays for a quick return.
+    pub(crate) async fn expire(&self, id: &str) {
+        if let Some(p) = self.get_in_memory(id).await {
+            p.write().await.last_reg_time = get_expired_time();
+        }
     }
 
     #[inline]
@@ -365,5 +378,64 @@ mod tests {
 
         let deserialized: PeerInfo = serde_json::from_str("{}").unwrap();
         assert!(deserialized.ip.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_does_not_cache_stored_rows() {
+        let pm = temp_peer_map().await;
+        pm.db.insert_peer("stored_only", b"u", b"p", "{}").await.unwrap();
+        assert!(pm.get("stored_only").await.is_some());
+        assert!(!pm.is_in_memory("stored_only").await);
+    }
+
+    #[tokio::test]
+    async fn get_reads_keys_changed_on_another_pod() {
+        let mut pm = temp_peer_map().await;
+        let live = pm.get_or("moved_key").await;
+        pm.update_pk(
+            "moved_key".to_owned(),
+            live.clone(),
+            "10.0.0.1:1".parse().unwrap(),
+            Bytes::from_static(b"uuid"),
+            Bytes::from_static(b"pk-old"),
+            "10.0.0.1".to_owned(),
+        )
+        .await;
+        let guid = live.read().await.guid.clone();
+        pm.db.update_pk(&guid, "moved_key", b"pk-new", r#"{"ip":"10.0.0.9"}"#).await.unwrap();
+
+        let got = pm.get("moved_key").await.unwrap();
+        assert!(Arc::ptr_eq(&got, &live), "the live entry keeps its liveness");
+        let r = got.read().await;
+        assert_eq!(r.pk, Bytes::from_static(b"pk-new"));
+        assert_eq!(r.info.ip, "10.0.0.9");
+        assert!(r.last_reg_time.elapsed().as_secs() < 5);
+    }
+
+    #[tokio::test]
+    async fn get_or_adopts_the_stored_row() {
+        let pm = temp_peer_map().await;
+        let guid = pm.db.insert_peer("adopt_me", b"u", b"p", "{}").await.unwrap();
+        let p = pm.get_or("adopt_me").await;
+        assert_eq!(p.read().await.guid, guid);
+        assert!(pm.is_in_memory("adopt_me").await);
+    }
+
+    #[tokio::test]
+    async fn get_falls_back_to_memory_when_the_database_fails() {
+        let pm = temp_peer_map().await;
+        let live = pm.get_or("db_down").await;
+        pm.db.pool().close().await;
+        assert!(Arc::ptr_eq(&pm.get("db_down").await.unwrap(), &live));
+    }
+
+    #[tokio::test]
+    async fn expire_marks_the_device_gone_here() {
+        let pm = temp_peer_map().await;
+        let live = pm.get_or("expire_me").await;
+        live.write().await.last_reg_time = Instant::now();
+        pm.expire("expire_me").await;
+        assert!(live.read().await.last_reg_time.elapsed().as_secs() >= 3599);
+        pm.expire("not_here").await;
     }
 }

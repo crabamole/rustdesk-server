@@ -733,7 +733,10 @@ impl RendezvousServer {
             }
         }
         if changed {
-            self.pm.update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip).await;
+            let res = self.pm.update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip).await;
+            if res != register_pk_response::Result::OK {
+                return Err(res);
+            }
         }
         Ok((register_pk_response::Result::OK, id))
         // let mut msg_out = RendezvousMessage::new();
@@ -2113,6 +2116,36 @@ mod tests {
 
     mod handle_register_pk_tests {
         use super::*;
+
+        #[tokio::test]
+        async fn test_register_pk_answers_server_error_when_the_write_fails() {
+            let (mut rs, _rx) = test_server().await;
+            sqlx::query("DROP TABLE peer").execute(rs.pm.db.pool()).await.unwrap();
+            let rk = RegisterPk {
+                id: "dbfail123".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![2; 32].into(),
+                ..Default::default()
+            };
+            let result = rs.handle_register_pk(rk, "10.9.9.9:1234".parse().unwrap()).await;
+            assert_eq!(result, Err(register_pk_response::Result::SERVER_ERROR));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_sees_a_key_changed_on_another_pod() {
+            let (mut rs, _rx) = test_server().await;
+            let rk = |pk: u8| RegisterPk {
+                id: "moved_pk1".to_owned(),
+                uuid: vec![1; 16].into(),
+                pk: vec![pk; 32].into(),
+                ..Default::default()
+            };
+            assert!(rs.handle_register_pk(rk(2), "10.7.0.1:1".parse().unwrap()).await.is_ok());
+            let guid = rs.pm.get_in_memory("moved_pk1").await.unwrap().read().await.guid.clone();
+            rs.pm.db.update_pk(&guid, "moved_pk1", &[3; 32], r#"{"ip":"10.7.0.2"}"#).await.unwrap();
+            let result = rs.handle_register_pk(rk(3), "10.7.0.2:1".parse().unwrap()).await;
+            assert!(matches!(result, Ok((register_pk_response::Result::OK, _))), "{result:?}");
+        }
 
         #[tokio::test]
         async fn test_register_pk_empty_uuid_rejected() {
