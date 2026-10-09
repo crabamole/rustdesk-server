@@ -6,7 +6,7 @@ use std::{
 };
 
 mod common;
-use common::pair;
+use common::{pair, request_relay, ws_connect_path};
 
 struct Hbbr {
     child: Child,
@@ -172,4 +172,27 @@ async fn test_sigint_while_draining_exits_at_once() {
         .await
         .expect("SIGINT ends a drain");
     assert!(exit.success(), "exit status {exit:?}");
+}
+
+#[tokio::test]
+async fn test_drain_waits_for_a_lone_first_half() {
+    let mut hbbr = start_hbbr().await;
+    // No pair ever comes: the half leaves PEERS only when hbbr's 30 s wait ends.
+    let mut half = ws_connect_path(hbbr.ws_port, "").await;
+    request_relay(&mut half, "drain-lone-half").await;
+    sleep(Duration::from_millis(300)).await;
+
+    signal(&hbbr.child, "TERM");
+    assert!(wait_for_status(hbbr.health_port, "/readyz", 503, Duration::from_secs(2)).await);
+    sleep(Duration::from_secs(11)).await;
+    assert!(
+        hbbr.child.try_wait().unwrap().is_none(),
+        "hbbr exited with a first half waiting"
+    );
+
+    let exit = wait_for_exit(&mut hbbr.child, Duration::from_secs(25))
+        .await
+        .expect("drain ends once the waiting half times out");
+    assert!(exit.success(), "exit status {exit:?}");
+    drop(half);
 }

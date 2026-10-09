@@ -50,6 +50,8 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_millis(crate::health::PROBE_TI
 // hbbs polls /readyz every 3 s and clients dial a handed-out URL shortly after.
 // A connection that never completes the upgrade must not hold a drain open.
 const WS_HANDSHAKE_MS: u64 = 30_000;
+// hbbs may hand out this pod's URL for a few seconds after /readyz turns 503 (3 s poll + up to
+// 2 s check); clients relay at once (forced relay), so 10 s covers it.
 const DRAIN_MIN: Duration = Duration::from_secs(10);
 
 #[tokio::main(flavor = "multi_thread")]
