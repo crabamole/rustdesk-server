@@ -4166,12 +4166,19 @@ mod tests {
             let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
             rs.ws_peers.lock().await.insert("drain_dev".to_owned(), (1, sink));
             rs.cluster.presence.register("drain_dev", 1).await;
+            let rows = || async {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM peer_presence WHERE id = 'drain_dev'")
+                    .fetch_one(rs.pm.db.pool())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(rows().await, 1);
 
             rs.drain().await;
             assert!(rs.cluster.is_draining());
             assert!(rs.ws_peers.lock().await.is_empty());
             assert!(timeout(5000, client.next()).await.unwrap().is_none(), "the device sees its connection end");
-            assert!(other_pod(&rs).holder("drain_dev").await.is_none());
+            assert_eq!(rows().await, 0);
         }
 
         #[test]
