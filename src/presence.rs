@@ -161,23 +161,23 @@ impl Presence {
         let ids: Vec<String> = devices.iter().map(|(id, _)| id.clone()).collect();
         let gens: Vec<i64> = devices.iter().map(|(_, gen)| gen_i64(*gen)).collect();
         let res = async {
-        let mut tx = self.pool.begin().await?;
-        let upserted = sqlx::query(CLAIM)
-            .bind(&ids)
-            .bind(&self.pod)
-            .bind(&self.epoch)
-            .bind(&gens)
-            .execute(&mut *tx)
-            .await?;
-        // Rows of connections that ended while a delete failed.
-        sqlx::query("DELETE FROM peer_presence WHERE pod = $1 AND epoch = $2::uuid AND id <> ALL($3)")
-            .bind(&self.pod)
-            .bind(&self.epoch)
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok::<_, sqlx::Error>(upserted)
+            let mut tx = self.pool.begin().await?;
+            let upserted = sqlx::query(CLAIM)
+                .bind(&ids)
+                .bind(&self.pod)
+                .bind(&self.epoch)
+                .bind(&gens)
+                .execute(&mut *tx)
+                .await?;
+            // Rows of connections that ended while a delete failed.
+            sqlx::query("DELETE FROM peer_presence WHERE pod = $1 AND epoch = $2::uuid AND id <> ALL($3)")
+                .bind(&self.pod)
+                .bind(&self.epoch)
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(upserted)
         }
         .await;
         match res {
