@@ -10,6 +10,7 @@ use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
 const PEER_FIXTURE: &str = include_str!("../tests/fixtures/peer.sql");
+const PRESENCE_FIXTURE: &str = include_str!("../tests/fixtures/hbbs_presence.sql");
 
 /// Name of the shared, reused Postgres test container. Fixed so that
 /// `ReuseDirective::Always` can find and reattach to it across process runs,
@@ -133,11 +134,12 @@ pub async fn fresh_database_url() -> String {
     format!("{}/{}", pg.base_url, name)
 }
 
-/// URL of a new database that already has the api-server's `peer` table.
+/// URL of a new database that already has the api-server's `peer` and hbbs presence tables.
 pub async fn fresh_peer_database_url() -> String {
     let url = fresh_database_url().await;
     let mut conn = PgConnection::connect(&url).await.unwrap();
     conn.execute(PEER_FIXTURE).await.unwrap();
+    conn.execute(PRESENCE_FIXTURE).await.unwrap();
     conn.close().await.unwrap();
     url
 }

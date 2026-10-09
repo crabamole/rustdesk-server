@@ -1,9 +1,12 @@
-use hbb_common::{log, ResultType};
+use hbb_common::{bail, log, ResultType};
 use sqlx::{
     postgres::{PgPoolOptions, PgRow},
     Connection, PgConnection, PgPool, Row,
 };
 use std::time::Duration;
+
+const SCHEMA_TABLES: [&str; 3] = ["peer", "hbbs_pod", "peer_presence"];
+const PING_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Clone)]
 pub struct Database {
@@ -21,7 +24,7 @@ impl std::fmt::Display for SchemaNotReady {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "schema not ready (table peer not found; it is created by the api-server): {}",
+            "schema not ready (tables peer, hbbs_pod and peer_presence are created by the api-server): {}",
             self.0
         )
     }
@@ -70,9 +73,12 @@ impl Database {
             .acquire_timeout(Duration::from_secs(5))
             .connect(url)
             .await?;
-        if let Err(e) = sqlx::query("SELECT 1 FROM peer LIMIT 1").fetch_optional(&pool).await {
-            pool.close().await;
-            return Err(SchemaNotReady(e).into());
+        for table in SCHEMA_TABLES {
+            let sql = format!("SELECT 1 FROM {table} LIMIT 1");
+            if let Err(e) = sqlx::query(&sql).fetch_optional(&pool).await {
+                pool.close().await;
+                return Err(SchemaNotReady(e).into());
+            }
         }
         log::info!("Database ready, max_connections={max_connections}");
         Ok(Database { pool })
@@ -94,6 +100,17 @@ impl Database {
         }
     }
 
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub(crate) async fn ping(&self) -> bool {
+        matches!(
+            hbb_common::timeout(PING_TIMEOUT_MS, sqlx::query("SELECT 1").execute(&self.pool)).await,
+            Ok(Ok(_))
+        )
+    }
+
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
         let row = sqlx::query(
             "SELECT guid, id, uuid, pk, \"user\", status, info FROM peer WHERE id = $1",
@@ -107,6 +124,7 @@ impl Database {
         }
     }
 
+    /// Inserts a new device, or takes the row another pod just inserted for the same id and uuid.
     pub async fn insert_peer(
         &self,
         id: &str,
@@ -115,17 +133,25 @@ impl Database {
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
-        sqlx::query(
-            "INSERT INTO peer(guid, id, uuid, pk, info) VALUES($1, $2, $3, $4, $5)",
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "INSERT INTO peer(guid, id, uuid, pk, info) VALUES($1, $2, $3, $4, $5) \
+             ON CONFLICT (id) DO UPDATE SET pk = EXCLUDED.pk, \
+             info = (COALESCE(NULLIF(peer.info, ''), '{}')::jsonb \
+                     || COALESCE(NULLIF(EXCLUDED.info, ''), '{}')::jsonb)::text \
+             WHERE peer.uuid = EXCLUDED.uuid \
+             RETURNING guid",
         )
         .bind(&guid)
         .bind(id)
         .bind(uuid)
         .bind(pk)
         .bind(info)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(guid)
+        match row {
+            Some((guid,)) => Ok(guid),
+            None => bail!("peer {id} is registered with another uuid"),
+        }
     }
 
     pub async fn update_pk(
@@ -295,13 +321,50 @@ mod tests {
         assert_eq!(merged, serde_json::json!({"ip":"203.0.113.5"}));
     });
 
-    db_test!(insert_duplicate_id_fails, |db| {
-        let uuid = b"test-uuid-bytes!";
-        let pk = b"test-pk-bytes!!!";
+    #[tokio::test]
+    async fn new_fails_without_presence_tables() {
+        let url = crate::testing::fresh_database_url().await;
+        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&url).await.unwrap();
+        sqlx::Executor::execute(&mut c, include_str!("../tests/fixtures/peer.sql")).await.unwrap();
+        let err = Database::new(&url).await.err().expect("presence tables are missing");
+        assert!(err.to_string().contains("schema not ready"), "{err}");
+    }
 
-        db.insert_peer("dup_id", uuid, pk, "{}").await.unwrap();
-        let result = db.insert_peer("dup_id", uuid, pk, "{}").await;
-        assert!(result.is_err());
+    db_test!(insert_same_id_and_uuid_keeps_the_row, |db| {
+        let first = db.insert_peer("dup_id", b"uuid-1", b"pk-1", r#"{"ip":"10.0.0.1"}"#).await.unwrap();
+        let second = db.insert_peer("dup_id", b"uuid-1", b"pk-2", r#"{"ip":"10.0.0.2"}"#).await.unwrap();
+        assert_eq!(first, second);
+        let peer = db.get_peer("dup_id").await.unwrap().unwrap();
+        assert_eq!(peer.pk, b"pk-2".to_vec());
+        let info: serde_json::Value = serde_json::from_str(&peer.info).unwrap();
+        assert_eq!(info["ip"], "10.0.0.2");
+    });
+
+    db_test!(insert_same_id_other_uuid_fails, |db| {
+        db.insert_peer("dup_id2", b"uuid-1", b"pk", "{}").await.unwrap();
+        assert!(db.insert_peer("dup_id2", b"uuid-2", b"pk", "{}").await.is_err());
+        assert_eq!(db.get_peer("dup_id2").await.unwrap().unwrap().uuid, b"uuid-1".to_vec());
+    });
+
+    db_test!(racing_first_registrations_agree, |db| {
+        let jobs: Vec<_> = (0..8)
+            .map(|_| {
+                let db = db.clone();
+                tokio::spawn(async move { db.insert_peer("race_id", b"u", b"p", "{}").await.unwrap() })
+            })
+            .collect();
+        let guids: std::collections::HashSet<Vec<u8>> = hbb_common::futures::future::join_all(jobs)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(guids.len(), 1);
+    });
+
+    db_test!(ping_follows_the_pool, |db| {
+        assert!(db.ping().await);
+        db.pool().close().await;
+        assert!(!db.ping().await);
     });
 
     db_test!(update_pk_changes_id, |db| {
@@ -340,6 +403,7 @@ mod tests {
             hbb_common::tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&url2).await.unwrap();
             sqlx::Executor::execute(&mut c, include_str!("../tests/fixtures/peer.sql")).await.unwrap();
+            sqlx::Executor::execute(&mut c, include_str!("../tests/fixtures/hbbs_presence.sql")).await.unwrap();
         });
         let db = hbb_common::tokio::time::timeout(
             std::time::Duration::from_secs(20),
