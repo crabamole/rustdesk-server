@@ -31,11 +31,16 @@ pub(crate) async fn serve(listener: std::net::TcpListener, probe: Arc<dyn Probe>
 }
 
 async fn livez(Extension(probe): Extension<Arc<dyn Probe>>) -> StatusCode {
-    status(probe.live().await)
+    status(bounded(probe.live()).await)
 }
 
 async fn readyz(Extension(probe): Extension<Arc<dyn Probe>>) -> StatusCode {
-    status(probe.live().await && probe.ready().await)
+    status(bounded(probe.live()).await && bounded(probe.ready()).await)
+}
+
+/// A probe that does not answer in time counts as failed.
+async fn bounded(probe: impl std::future::Future<Output = bool>) -> bool {
+    hbb_common::timeout(PROBE_TIMEOUT_MS, probe).await.unwrap_or(false)
 }
 
 fn status(ok: bool) -> StatusCode {
@@ -90,5 +95,36 @@ mod tests {
     async fn other_paths_are_404() {
         let base = spawn_stub(true, true).await;
         assert_eq!(status(format!("{base}/")).await, 404);
+    }
+
+    struct Hang {
+        hang_live: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Probe for Hang {
+        async fn live(&self) -> bool {
+            if self.hang_live {
+                std::future::pending::<()>().await;
+            }
+            true
+        }
+        async fn ready(&self) -> bool {
+            std::future::pending::<()>().await;
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_probe_is_503_within_bound() {
+        for (hang_live, path) in [(true, "livez"), (true, "readyz"), (false, "readyz")] {
+            let listener = bind(0).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(serve(listener, Arc::new(Hang { hang_live })));
+            let start = std::time::Instant::now();
+            let got = tokio::time::timeout(std::time::Duration::from_secs(4), status(format!("http://127.0.0.1:{port}/{path}"))).await;
+            assert_eq!(got.ok(), Some(503), "{path} hang_live={hang_live}");
+            assert!(start.elapsed() < std::time::Duration::from_millis(2_500), "{path} took {:?}", start.elapsed());
+        }
     }
 }
