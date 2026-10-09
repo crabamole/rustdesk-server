@@ -5,6 +5,8 @@ use hbb_common::{
     tokio::{self, time::timeout},
 };
 use hbbs::relay_server::TestRelayServer;
+
+mod common;
 use std::time::Duration;
 
 #[tokio::test]
@@ -385,31 +387,7 @@ async fn test_health_live_and_ready() {
 #[tokio::test]
 async fn test_relay_pairs_on_any_ws_path() {
     let server = TestRelayServer::start("").await.expect("start relay");
-    let ws_port = server.ws_port;
-    let connect = |path: &'static str| async move {
-        let stream = hbb_common::tokio::net::TcpStream::connect(format!("127.0.0.1:{ws_port}"))
-            .await
-            .unwrap();
-        let (ws, _) = tokio_tungstenite::client_async(format!("ws://127.0.0.1:{ws_port}{path}"), stream)
-            .await
-            .unwrap();
-        ws
-    };
-    let mut req = RendezvousMessage::new();
-    req.set_request_relay(RequestRelay {
-        uuid: "test-any-path-uuid".to_owned(),
-        ..Default::default()
-    });
-    let req = req.write_to_bytes().unwrap();
-    let mut ws_a = connect("/ws/relay/3").await;
-    ws_a.send(tungstenite::Message::Binary(req.clone())).await.unwrap();
-    hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut ws_b = connect("/ws/relay").await;
-    ws_b.send(tungstenite::Message::Binary(req)).await.unwrap();
-    hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
-    ws_a.send(tungstenite::Message::Binary(b"via /ws/relay/3".to_vec())).await.unwrap();
-    let received = timeout(Duration::from_secs(3), ws_b.next()).await.unwrap().unwrap().unwrap();
-    assert_eq!(received, tungstenite::Message::Binary(b"via /ws/relay/3".to_vec()));
+    common::pair_on(server.ws_port, "test-any-path-uuid", "/ws/relay/3", "/ws/relay").await;
     server.shutdown();
 }
 
@@ -419,5 +397,25 @@ async fn test_draining_fails_readyz_only() {
     server.start_draining();
     assert_eq!(health_status(server.health_port, "/livez").await, 200);
     assert_eq!(health_status(server.health_port, "/readyz").await, 503);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn test_draining_still_pairs_and_counts_the_session() {
+    let server = TestRelayServer::start("").await.expect("start relay");
+    server.start_draining();
+    let (a, b) = common::pair(server.ws_port, "test-draining-pair-uuid").await;
+    // The second half carries the pair; the first left the count when it waited.
+    assert_eq!(server.sessions(), 1);
+
+    drop(a);
+    drop(b);
+    let gone = timeout(Duration::from_secs(3), async {
+        while server.sessions() > 0 {
+            hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "the session ends when both halves close");
     server.shutdown();
 }

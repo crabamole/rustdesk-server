@@ -47,6 +47,8 @@ const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 const HEALTH_PORT: u16 = 21122;
 const LIVENESS_TIMEOUT: Duration = Duration::from_millis(crate::health::PROBE_TIMEOUT_MS);
+// hbbs polls /readyz every 3 s and clients dial a handed-out URL shortly after.
+const DRAIN_MIN: Duration = Duration::from_secs(10);
 
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start(port: &str, key: &str) -> ResultType<()> {
@@ -89,18 +91,24 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
     log::info!("Listening on health :{}", health_port);
     let health_listener = crate::health::bind(health_port)?;
     let (health, mut pings) = Health::new();
+    let loop_health = health.clone();
     let main_task = async move {
         loop {
             log::info!("Start");
-            io_loop(listen_any(port).await?, listen_any(port2).await?, &key, &mut pings).await;
+            io_loop(listen_any(port).await?, listen_any(port2).await?, &key, &loop_health, &mut pings).await;
         }
     };
-    let health_task = crate::health::serve(health_listener, health);
-    let listen_signal = crate::common::listen_signal();
+    let health_task = crate::health::serve(health_listener, health.clone());
+    let shutdown = async {
+        if shutdown_signal().await? {
+            health.drain(DRAIN_MIN).await;
+        }
+        Ok(())
+    };
     tokio::select!(
         res = main_task => res,
         res = health_task => res,
-        res = listen_signal => res,
+        res = shutdown => res,
     )
 }
 
@@ -115,7 +123,17 @@ type Ping = tokio::sync::oneshot::Sender<()>;
 
 struct Health {
     draining: AtomicBool,
+    sessions: AtomicUsize,
     ping: tokio::sync::mpsc::Sender<Ping>,
+}
+
+/// Counts a connection from accept until it closes or waits in PEERS.
+struct Session(Arc<Health>);
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.0.sessions.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Health {
@@ -123,9 +141,31 @@ impl Health {
         let (ping, pings) = tokio::sync::mpsc::channel(16);
         let health = Self {
             draining: AtomicBool::new(false),
+            sessions: AtomicUsize::new(0),
             ping,
         };
         (Arc::new(health), pings)
+    }
+
+    fn session(self: &Arc<Self>) -> Session {
+        self.sessions.fetch_add(1, Ordering::SeqCst);
+        Session(self.clone())
+    }
+
+    /// Fails readiness, keeps accepting, and returns once no session is left.
+    async fn drain(&self, min: Duration) {
+        self.draining.store(true, Ordering::SeqCst);
+        log::info!(
+            "Draining: {} connections, {} waiting for their pair",
+            self.sessions.load(Ordering::SeqCst),
+            PEERS.lock().await.len()
+        );
+        tokio::time::sleep(min).await;
+        let mut tick = interval(Duration::from_secs(1));
+        while self.sessions.load(Ordering::SeqCst) > 0 || !PEERS.lock().await.is_empty() {
+            tick.tick().await;
+        }
+        log::info!("Drained");
     }
 }
 
@@ -144,6 +184,25 @@ impl crate::health::Probe for Health {
     async fn ready(&self) -> bool {
         !self.draining.load(Ordering::SeqCst)
     }
+}
+
+/// Ok(true) on SIGTERM, which drains; Ok(false) on SIGINT or SIGQUIT, which exit at once.
+#[cfg(unix)]
+async fn shutdown_signal() -> ResultType<bool> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut quit = signal(SignalKind::quit())?;
+    Ok(tokio::select! {
+        _ = term.recv() => { log::info!("signal terminate"); true }
+        _ = int.recv() => { log::info!("signal interrupt"); false }
+        _ = quit.recv() => { log::info!("signal quit"); false }
+    })
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> ResultType<bool> {
+    std::future::pending().await
 }
 
 fn check_params() {
@@ -378,6 +437,7 @@ async fn io_loop(
     listener: TcpListener,
     listener2: TcpListener,
     key: &str,
+    health: &Arc<Health>,
     pings: &mut tokio::sync::mpsc::Receiver<Ping>,
 ) {
     check_params();
@@ -391,7 +451,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, false).await;
+                        handle_connection(stream, addr, &limiter, key, false, health).await;
                     }
                     Err(err) => {
                        log::error!("listener.accept failed: {}", err);
@@ -403,7 +463,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, true).await;
+                        handle_connection(stream, addr, &limiter, key, true, health).await;
                     }
                     Err(err) => {
                        log::error!("listener2.accept failed: {}", err);
@@ -421,6 +481,7 @@ async fn handle_connection(
     limiter: &Limiter,
     key: &str,
     ws: bool,
+    health: &Arc<Health>,
 ) {
     let ip = hbb_common::try_into_v4(addr).ip();
     if !ws && ip.is_loopback() {
@@ -444,8 +505,9 @@ async fn handle_connection(
     }
     let key = key.to_owned();
     let limiter = limiter.clone();
+    let session = health.session();
     tokio::spawn(async move {
-        allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
+        allow_err!(make_pair(stream, addr, &key, limiter, ws, session).await);
     });
 }
 
@@ -455,6 +517,7 @@ async fn make_pair(
     key: &str,
     limiter: Limiter,
     ws: bool,
+    session: Session,
 ) -> ResultType<()> {
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -469,14 +532,20 @@ async fn make_pair(
             Ok(response)
         };
         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-        make_pair_(ws_stream, addr, key, limiter).await;
+        make_pair_(ws_stream, addr, key, limiter, session).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        make_pair_(FramedStream::from(stream, addr), addr, key, limiter, session).await;
     }
     Ok(())
 }
 
-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
+async fn make_pair_(
+    stream: impl StreamTrait,
+    addr: SocketAddr,
+    key: &str,
+    limiter: Limiter,
+    session: Session,
+) {
     if BLOCKLIST.read().await.contains(&addr.ip().to_canonical().to_string()) {
         // The accept-time check saw only the proxy for WebSocket clients.
         log::info!("{} blocked", addr.ip());
@@ -511,6 +580,8 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
                         PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+                        // From here the half is counted through PEERS, then by its pair.
+                        drop(session);
                         sleep(30.).await;
                         PEERS.lock().await.remove(&rf.uuid);
                     }
@@ -725,6 +796,10 @@ impl TestRelayServer {
         self.health.draining.store(true, Ordering::SeqCst);
     }
 
+    pub fn sessions(&self) -> usize {
+        self.health.sessions.load(Ordering::SeqCst)
+    }
+
     pub async fn start(key: &str) -> hbb_common::ResultType<Self> {
         let key = get_server_sk(key);
         let listener = hbb_common::tcp::listen_any(0).await?;
@@ -734,6 +809,7 @@ impl TestRelayServer {
         let health_listener = crate::health::bind(0)?;
         let health_port = health_listener.local_addr()?.port();
         let (health, mut pings) = Health::new();
+        let loop_health = health.clone();
         let health_task = crate::health::serve(health_listener, health.clone());
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -741,7 +817,7 @@ impl TestRelayServer {
 
         tokio::spawn(async move {
             tokio::select! {
-                _ = io_loop(listener, listener2, &key, &mut pings) => {}
+                _ = io_loop(listener, listener2, &key, &loop_health, &mut pings) => {}
                 _ = health_task => {}
                 _ = &mut shutdown_rx => {}
             }
@@ -1031,6 +1107,44 @@ mod tests {
             std::env::set_var("HEALTH_PORT", "not-a-port");
             assert_eq!(health_port(), 21122);
             std::env::remove_var("HEALTH_PORT");
+        }
+
+        #[tokio::test]
+        async fn sessions_count_until_dropped() {
+            let (health, _pings) = Health::new();
+            let a = health.session();
+            let b = health.session();
+            assert_eq!(health.sessions.load(Ordering::SeqCst), 2);
+            drop(a);
+            assert_eq!(health.sessions.load(Ordering::SeqCst), 1);
+            drop(b);
+            assert_eq!(health.sessions.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn drain_waits_the_minimum() {
+            let (health, _pings) = Health::new();
+            let start = std::time::Instant::now();
+            health.drain(Duration::from_millis(200)).await;
+            assert!(start.elapsed() >= Duration::from_millis(200));
+            assert!(health.draining.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn drain_waits_for_the_last_session() {
+            let (health, _pings) = Health::new();
+            let session = health.session();
+            let drained = tokio::spawn({
+                let health = health.clone();
+                async move { health.drain(Duration::from_millis(10)).await }
+            });
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert!(!drained.is_finished());
+            drop(session);
+            tokio::time::timeout(Duration::from_secs(3), drained)
+                .await
+                .expect("drain returns once the session is gone")
+                .unwrap();
         }
     }
 

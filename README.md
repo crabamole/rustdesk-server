@@ -23,7 +23,7 @@ rustdesk-api.
 | Binary | Role | Ports |
 | --- | --- | --- |
 | `hbbs` | ID/rendezvous server | `21116` TCP+UDP (rendezvous), `21115` TCP (NAT test), `21118` TCP (WebSocket), `21120` TCP (pod-to-pod, cluster only), `21121` HTTP (`/livez`, `/readyz`) |
-| `hbbr` | Relay server | `21117` TCP (relay), `21119` TCP (WebSocket) |
+| `hbbr` | Relay server | `21117` TCP (relay), `21119` TCP (WebSocket), `21122` TCP (HTTP health) |
 | `rustdesk-utils` | CLI utilities, e.g. `genkeypair` | — |
 
 The NAT test and WebSocket ports follow the main port: `PORT - 1` and `PORT + 2`.
@@ -117,11 +117,14 @@ file in the working directory, or in an INI file passed with `-c`.
 | --- | --- | --- |
 | `-p, --port` | `PORT` | Relay port (default `21117`) |
 | `-k, --key` | `KEY` | Only allow clients with this key (`-`: use the working-directory keypair) |
+| | `HEALTH_PORT` | HTTP health port (default `21122`): `GET /livez`, `GET /readyz` |
 | | `LIMIT_SPEED` | Speed limit (Mb/s) |
 | | `TOTAL_BANDWIDTH` | Max total bandwidth (Mb/s) |
 | | `SINGLE_BANDWIDTH` | Max bandwidth per connection (Mb/s) |
 | | `DOWNGRADE_THRESHOLD` | Threshold of the downgrade check (bit/ms) |
 | | `DOWNGRADE_START_CHECK` | Delay before the downgrade check (seconds) |
+
+On SIGTERM hbbr fails `/readyz` and keeps accepting and relaying; it exits once no session is open or waiting for its pair, at the earliest 10 s after the signal. SIGINT and SIGQUIT exit at once. Give the pod a termination grace period long enough for sessions to end.
 
 Both binaries honour `RUST_LOG` (`error`, `warn`, `info`, `debug`, `trace`).
 
