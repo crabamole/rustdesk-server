@@ -6,7 +6,6 @@ use sqlx::{
 use std::time::Duration;
 
 const SCHEMA_TABLES: [&str; 3] = ["peer", "hbbs_pod", "peer_presence"];
-const PING_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Clone)]
 pub struct Database {
@@ -102,13 +101,6 @@ impl Database {
 
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    pub(crate) async fn ping(&self) -> bool {
-        matches!(
-            hbb_common::timeout(PING_TIMEOUT_MS, sqlx::query("SELECT 1").execute(&self.pool)).await,
-            Ok(Ok(_))
-        )
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
@@ -359,12 +351,6 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(guids.len(), 1);
-    });
-
-    db_test!(ping_follows_the_pool, |db| {
-        assert!(db.ping().await);
-        db.pool().close().await;
-        assert!(!db.ping().await);
     });
 
     db_test!(update_pk_changes_id, |db| {

@@ -1698,7 +1698,6 @@ impl RendezvousServer {
             .0
             .set(ServerProbe {
                 tx: self.tx.clone(),
-                db: self.pm.db.clone(),
                 cluster: self.cluster.clone(),
             })
             .ok();
@@ -1763,7 +1762,6 @@ impl RendezvousServer {
 
 struct ServerProbe {
     tx: Sender,
-    db: crate::database::Database,
     cluster: Arc<crate::cluster::Cluster>,
 }
 
@@ -1775,8 +1773,9 @@ impl crate::health::Probe for ServerProbe {
             && matches!(timeout(crate::health::PROBE_TIMEOUT_MS, answered.recv()).await, Ok(Some(())))
     }
 
+    /// Not the database: every pod shares it, and an unready pod's open device flows get reset.
     async fn ready(&self) -> bool {
-        !self.cluster.is_draining() && self.db.ping().await
+        !self.cluster.is_draining()
     }
 }
 
@@ -4237,7 +4236,7 @@ mod tests {
         #[tokio::test]
         async fn probe_live_goes_through_the_event_loop() {
             let (rs, mut rx) = test_server().await;
-            let probe = ServerProbe { tx: rs.tx.clone(), db: rs.pm.db.clone(), cluster: rs.cluster.clone() };
+            let probe = ServerProbe { tx: rs.tx.clone(), cluster: rs.cluster.clone() };
             let answer = tokio::spawn(async move {
                 if let Some(Data::Ping(reply)) = rx.recv().await {
                     reply.send(()).ok();
@@ -4254,22 +4253,22 @@ mod tests {
             assert!(probe.live().await);
             assert!(!probe.ready().await);
             let (rs, _rx) = test_server().await;
-            probe.0.set(ServerProbe { tx: rs.tx.clone(), db: rs.pm.db.clone(), cluster: rs.cluster.clone() }).ok();
+            probe.0.set(ServerProbe { tx: rs.tx.clone(), cluster: rs.cluster.clone() }).ok();
             assert!(probe.ready().await);
         }
 
         #[tokio::test]
-        async fn probe_ready_needs_the_database_and_no_drain() {
+        async fn probe_ready_needs_no_drain_but_not_the_database() {
             let (rs, _rx) = test_server().await;
-            let probe = ServerProbe { tx: rs.tx.clone(), db: rs.pm.db.clone(), cluster: rs.cluster.clone() };
+            let probe = ServerProbe { tx: rs.tx.clone(), cluster: rs.cluster.clone() };
             assert!(probe.ready().await);
             rs.cluster.start_draining();
             assert!(!probe.ready().await);
 
             let (rs, _rx) = test_server().await;
-            let probe = ServerProbe { tx: rs.tx.clone(), db: rs.pm.db.clone(), cluster: rs.cluster.clone() };
+            let probe = ServerProbe { tx: rs.tx.clone(), cluster: rs.cluster.clone() };
             rs.pm.db.pool().close().await;
-            assert!(!probe.ready().await);
+            assert!(probe.ready().await, "a database outage must not take the pod out of its Service");
         }
 
         #[tokio::test]
