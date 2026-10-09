@@ -16,6 +16,7 @@ use std::{future::Future, net::SocketAddr, time::Duration};
 
 pub(crate) type Token = [u8; 32];
 pub(crate) const TIMEOUT_MS: u64 = 2_000;
+const MAX_CALL_BYTES: usize = 64 * 1024;
 const DEVICE: &str = "/device/";
 const VIEWER: &str = "/viewer/";
 
@@ -101,13 +102,17 @@ where
     H: Fn(Call) -> F,
     F: Future<Output = bool>,
 {
+    // Unauthenticated peers may only make us buffer a token-sized frame.
+    stream.0.codec_mut().set_max_packet_length(token.len());
     if !memcmp(&next(&mut stream).await?, token) {
         bail!("bad token");
     }
+    stream.0.codec_mut().set_max_packet_length(MAX_CALL_BYTES);
     let msg = RendezvousMessage::parse_from_bytes(&next(&mut stream).await?)?;
     let status = match Call::decode(&msg) {
         Some(call) => {
-            if handle(call).await {
+            let delivered = tokio::time::timeout(Duration::from_millis(TIMEOUT_MS), handle(call));
+            if delivered.await.unwrap_or(false) {
                 200
             } else {
                 404
@@ -214,6 +219,42 @@ mod tests {
         let frame = s.next_timeout(TIMEOUT_MS).await.unwrap().unwrap();
         let answer = RendezvousMessage::parse_from_bytes(&frame).unwrap();
         assert_eq!(answer.http_proxy_response().status, 400);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_header_before_the_token_is_dropped_at_once() {
+        use tokio::io::AsyncReadExt;
+        let addr = server([3; 32]).await;
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        // 4-byte header declaring a 512 MiB frame; no payload follows.
+        s.try_write(&(((1u32 << 29) << 2) | 3).to_le_bytes()).unwrap();
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(Duration::from_millis(TIMEOUT_MS / 2), s.read(&mut buf));
+        assert!(matches!(read.await, Ok(Ok(0)) | Ok(Err(_))));
+    }
+
+    #[tokio::test]
+    async fn a_hung_handler_answers_404() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(serve(listener, [3; 32], |_| std::future::pending::<bool>()));
+        let mut s = FramedStream::new(addr.as_str(), None, TIMEOUT_MS).await.unwrap();
+        s.send_raw(vec![3; 32]).await.unwrap();
+        s.send(&device("here").encode().unwrap()).await.unwrap();
+        let frame = s.next_timeout(TIMEOUT_MS * 2).await.unwrap().unwrap();
+        let answer = RendezvousMessage::parse_from_bytes(&frame).unwrap();
+        assert_eq!(answer.http_proxy_response().status, 404);
+    }
+
+    #[tokio::test]
+    async fn a_silent_client_is_closed_after_the_timeout() {
+        let addr = server([3; 32]).await;
+        let mut s = FramedStream::new(addr.as_str(), None, TIMEOUT_MS).await.unwrap();
+        let start = std::time::Instant::now();
+        assert!(s.next_timeout(TIMEOUT_MS * 2).await.is_none());
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(TIMEOUT_MS - 200), "{waited:?}");
+        assert!(waited < Duration::from_millis(TIMEOUT_MS * 2), "{waited:?}");
     }
 
     #[tokio::test]
