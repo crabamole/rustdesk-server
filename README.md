@@ -125,6 +125,20 @@ file in the working directory, or in an INI file passed with `-c`.
 
 Both binaries honour `RUST_LOG` (`error`, `warn`, `info`, `debug`, `trace`).
 
+## Multiple replicas
+
+Several hbbs processes can share one database, e.g. as the pods of a Kubernetes StatefulSet
+(`POD_NAME` ends in the pod's ordinal, 0–31; `POD_IP` is its address).
+
+- Each pod records the devices it holds in `peer_presence` and refreshes its `hbbs_pod` row every
+  10 s; rows of a pod silent for 30 s, or of an earlier process, are ignored.
+- A connection request for a device on another pod is forwarded to it over `INTERNAL_PORT`; the
+  device's answer, wherever it arrives, is passed back to the pod holding the viewer. Only hbbs pods
+  must reach that port.
+- `OnlineRequest` on `/ws/id` is answered from presence across all pods.
+- The per-IP registration limits (`IP_BLOCK_PER_MINUTE`, `IP_BLOCK_IDS_PER_DAY`) count per pod, so the
+  effective limit is the number of pods times the setting.
+
 ## Building
 
 Requires a Rust toolchain.

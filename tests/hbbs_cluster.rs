@@ -15,14 +15,19 @@ use tungstenite::Message as WsMessage;
 
 type Ws = WebSocketStream<TcpStream>;
 
+const RELAY: &str = "wss://relay.test/ws/relay/0";
+
 /// Test-only ed25519 secret key: pods share one keypair, as in a deployment.
 const KEY: &str = "8xHdtm4mhNywDf8xTsEsrkHHTwOUlApFXKxNFJXnQeEXoj+9RmSytxmlyGz0RCBtYhwQ45x77o3jy8yM77rQCg==";
+/// Public half of `KEY`, which clients send as `licence_key`.
+const PK: &str = "F6I/vUZksrcZpchs9EQgbWIcEOOce+6N48vMjO+60Ao=";
 
 async fn start(pod: &str, db_url: Option<String>) -> TestServer {
     RendezvousServer::start_test_with(TestOptions {
         key: KEY.to_owned(),
         pod: pod.to_owned(),
         db_url,
+        relay_urls: vec![RELAY.to_owned()],
         ..Default::default()
     })
     .await
@@ -126,4 +131,125 @@ async fn health_endpoints_answer() {
     assert_eq!(http_status(server.health_port, "/livez").await, 200);
     assert_eq!(http_status(server.health_port, "/readyz").await, 200);
     server.shutdown();
+}
+
+async fn pair() -> (TestServer, TestServer) {
+    let pod0 = start("hbbs-0", None).await;
+    let pod1 = start("hbbs-1", Some(pod0.db_url.clone())).await;
+    (pod0, pod1)
+}
+
+fn relay_answer(socket_addr: hbb_common::bytes::Bytes, uuid: &str, id: &str) -> RendezvousMessage {
+    let mut rr = RelayResponse {
+        socket_addr,
+        uuid: uuid.to_owned(),
+        relay_server: RELAY.to_owned(),
+        ..Default::default()
+    };
+    rr.set_id(id.to_owned());
+    let mut msg = RendezvousMessage::new();
+    msg.set_relay_response(rr);
+    msg
+}
+
+#[tokio::test]
+async fn punch_hole_crosses_pods_both_ways() {
+    let (pod0, pod1) = pair().await;
+    let (_dw, mut dr, _) = device(pod0.ws_port, "clu_punch1").await;
+    assert_eq!(presence_pod(&pod0.db_url, "clu_punch1").await.as_deref(), Some("hbbs-0"));
+
+    // Viewer on hbbs-1 asks for a device held by hbbs-0.
+    let (mut vw, mut vr) = connect(pod1.ws_port).await;
+    let mut req = RendezvousMessage::new();
+    req.set_punch_hole_request(PunchHoleRequest {
+        id: "clu_punch1".to_owned(),
+        licence_key: PK.to_owned(),
+        ..Default::default()
+    });
+    send(&mut vw, req).await;
+
+    let ph = recv(&mut dr).await;
+    assert!(ph.has_punch_hole(), "{ph:?}");
+    assert_eq!(ph.punch_hole().relay_server, RELAY);
+    let viewer = hbb_common::AddrMangle::decode(&ph.punch_hole().socket_addr);
+    assert_eq!(viewer.port() >> 11, 1, "the token names hbbs-1");
+
+    // The device answers on a new connection to hbbs-0; hbbs-0 passes it back to hbbs-1.
+    let (mut aw, _ar) = connect(pod0.ws_port).await;
+    send(&mut aw, relay_answer(ph.punch_hole().socket_addr.clone(), "clu-uuid-1", "clu_punch1")).await;
+    let got = recv(&mut vr).await;
+    assert_eq!(got.relay_response().uuid, "clu-uuid-1");
+    assert_eq!(got.relay_response().relay_server, RELAY);
+    pod0.shutdown();
+    pod1.shutdown();
+}
+
+#[tokio::test]
+async fn request_relay_crosses_pods() {
+    let (pod0, pod1) = pair().await;
+    let (_dw, mut dr, _) = device(pod1.ws_port, "clu_relay1").await;
+    assert_eq!(presence_pod(&pod0.db_url, "clu_relay1").await.as_deref(), Some("hbbs-1"));
+
+    let (mut vw, mut vr) = connect(pod0.ws_port).await;
+    let mut req = RendezvousMessage::new();
+    req.set_request_relay(RequestRelay {
+        id: "clu_relay1".to_owned(),
+        uuid: "clu-uuid-2".to_owned(),
+        relay_server: RELAY.to_owned(),
+        ..Default::default()
+    });
+    send(&mut vw, req).await;
+
+    let rq = recv(&mut dr).await;
+    assert!(rq.has_request_relay(), "{rq:?}");
+    assert_eq!(hbb_common::AddrMangle::decode(&rq.request_relay().socket_addr).port() >> 11, 0);
+
+    let (mut aw, _ar) = connect(pod1.ws_port).await;
+    send(&mut aw, relay_answer(rq.request_relay().socket_addr.clone(), "clu-uuid-2", "clu_relay1")).await;
+    assert_eq!(recv(&mut vr).await.relay_response().uuid, "clu-uuid-2");
+    pod0.shutdown();
+    pod1.shutdown();
+}
+
+#[tokio::test]
+async fn a_row_of_an_earlier_epoch_answers_offline() {
+    let (pod0, pod1) = pair().await;
+    let (_dw, _dr, _) = device(pod0.ws_port, "clu_off1").await;
+    assert!(presence_pod(&pod0.db_url, "clu_off1").await.is_some());
+    let pool = sqlx::PgPool::connect(&pod0.db_url).await.unwrap();
+    sqlx::query("UPDATE peer_presence SET epoch = gen_random_uuid() WHERE id = 'clu_off1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (mut vw, mut vr) = connect(pod1.ws_port).await;
+    let mut req = RendezvousMessage::new();
+    req.set_punch_hole_request(PunchHoleRequest {
+        id: "clu_off1".to_owned(),
+        licence_key: PK.to_owned(),
+        ..Default::default()
+    });
+    send(&mut vw, req).await;
+    let resp = recv(&mut vr).await;
+    assert_eq!(resp.punch_hole_response().failure, punch_hole_response::Failure::OFFLINE.into());
+    pod0.shutdown();
+    pod1.shutdown();
+}
+
+#[tokio::test]
+async fn online_request_over_ws_sees_other_pods() {
+    let (pod0, pod1) = pair().await;
+    let (_dw, _dr, _) = device(pod0.ws_port, "clu_online1").await;
+    assert!(presence_pod(&pod0.db_url, "clu_online1").await.is_some());
+
+    let (mut w, mut r) = connect(pod1.ws_port).await;
+    let mut req = RendezvousMessage::new();
+    req.set_online_request(OnlineRequest {
+        peers: vec!["clu_online1".to_owned(), "clu_nobody".to_owned()],
+        ..Default::default()
+    });
+    send(&mut w, req).await;
+    assert_eq!(&recv(&mut r).await.online_response().states[..], &[0b1000_0000]);
+    pod0.shutdown();
+    pod1.shutdown();
 }

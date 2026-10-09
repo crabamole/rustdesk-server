@@ -521,6 +521,16 @@ impl RendezvousServer {
                     // The target never needs the viewer's token.
                     rf.token.clear();
                     let target_id = rf.id.clone();
+                    let held_here = self.ws_peers.lock().await.contains_key(&target_id);
+                    if !held_here {
+                        let mut forward = rf.clone();
+                        forward.socket_addr = AddrMangle::encode(addr).into();
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_request_relay(forward);
+                        if self.cluster.deliver_to_device(&target_id, &msg_out).await == Some(true) {
+                            return (true, None);
+                        }
+                    }
                     if let Some(peer) = self.pm.get_in_memory(&target_id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
@@ -566,6 +576,15 @@ impl RendezvousServer {
                         res.cu = MessageField::from_option(Some(cu));
                     }
                     msg_out.set_test_nat_response(res);
+                    Self::send_to_sink(sink, msg_out).await;
+                    return (true, None);
+                }
+                Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_online_response(OnlineResponse {
+                        states: self.online_states(&or.peers).await.into(),
+                        ..Default::default()
+                    });
                     Self::send_to_sink(sink, msg_out).await;
                     return (true, None);
                 }
@@ -909,7 +928,10 @@ impl RendezvousServer {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
             };
-            if elapsed >= REG_TIMEOUT {
+            // Not live here: another live pod may hold it; its stored IP stands in for its address.
+            let remote = elapsed >= REG_TIMEOUT && self.cluster.presence.holder(&id).await.is_some();
+            let peer_addr = if remote { stored_addr(&peer).await } else { peer_addr };
+            if elapsed >= REG_TIMEOUT && !remote {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
@@ -995,19 +1017,7 @@ impl RendezvousServer {
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
-        let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
-        for (i, peer_id) in peers.iter().enumerate() {
-            if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
-                // bytes index from left to right
-                let states_idx = i / 8;
-                let bit_idx = 7 - i % 8;
-                if elapsed < REG_TIMEOUT {
-                    states[states_idx] |= 0x01 << bit_idx;
-                }
-            }
-        }
-
+        let states = self.online_states(&peers).await;
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_response(OnlineResponse {
             states: states.into(),
@@ -1020,6 +1030,9 @@ impl RendezvousServer {
 
     #[inline]
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
+        if self.cluster.deliver_to_viewer(addr, &msg).await {
+            return;
+        }
         let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         tokio::spawn(async move {
             Self::send_to_sink(&mut tcp, msg).await;
@@ -1051,6 +1064,9 @@ impl RendezvousServer {
         msg: RendezvousMessage,
         addr: SocketAddr,
     ) -> ResultType<()> {
+        if self.cluster.deliver_to_viewer(addr, &msg).await {
+            return Ok(());
+        }
         let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         Self::send_to_sink(&mut sink, msg).await;
         Ok(())
@@ -1109,7 +1125,11 @@ impl RendezvousServer {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(peer_addr) = to_addr {
             if !self.send_to_ws_peer(&target_id, msg.clone()).await {
-                self.tx.send(Data::Msg(msg.into(), peer_addr))?;
+                match self.cluster.deliver_to_device(&target_id, &msg).await {
+                    Some(true) => {}
+                    Some(false) => self.send_to_tcp_sync(offline_response(), addr).await?,
+                    None => self.tx.send(Data::Msg(msg.into(), peer_addr))?,
+                }
             }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
@@ -1413,6 +1433,7 @@ impl RendezvousServer {
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            addr = self.cluster.tokens.tag(addr);
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink {
                 tx: SinkType::Ws(a),
@@ -1460,6 +1481,7 @@ impl RendezvousServer {
                 }
             }
         } else {
+            addr = self.cluster.tokens.tag(addr);
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             let enc = Arc::new(Mutex::new(None));
             sink = Some(Sink {
@@ -1670,6 +1692,22 @@ impl RendezvousServer {
         }
     }
 
+    /// One bit per peer, leftmost first, as `OnlineResponse.states` expects.
+    async fn online_states(&self, peers: &[String]) -> BytesMut {
+        let elsewhere = self.cluster.presence.online(peers).await;
+        let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
+        for (i, id) in peers.iter().enumerate() {
+            let here = match self.pm.get_in_memory(id).await {
+                Some(p) => (p.read().await.last_reg_time.elapsed().as_millis() as i64) < REG_TIMEOUT,
+                None => false,
+            };
+            if here || elsewhere.contains(id) {
+                states[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+        states
+    }
+
     async fn ws_devices(&self) -> HashMap<String, u64> {
         let ws_peers = self.ws_peers.lock().await;
         ws_peers.iter().map(|(id, (gen, _))| (id.clone(), *gen)).collect()
@@ -1745,6 +1783,20 @@ fn internal_token(sk: &Option<sign::SecretKey>) -> ResultType<crate::internal::T
         Some(sk) => Ok(crate::internal::token(&sk.0)),
         None => bail!("hbbs needs its keypair (id_ed25519) to authenticate pod-to-pod calls"),
     }
+}
+
+fn offline_response() -> RendezvousMessage {
+    let mut msg_out = RendezvousMessage::new();
+    msg_out.set_punch_hole_response(PunchHoleResponse {
+        failure: punch_hole_response::Failure::OFFLINE.into(),
+        ..Default::default()
+    });
+    msg_out
+}
+
+async fn stored_addr(peer: &LockPeer) -> SocketAddr {
+    let ip = peer.read().await.info.ip.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    SocketAddr::new(ip, 0)
 }
 
 #[cfg(feature = "integration-test")]
@@ -4188,6 +4240,138 @@ mod tests {
             for s in [first, a, b] {
                 s.shutdown();
             }
+        }
+
+        /// Pod `hbbs-1` with an internal server that records calls and answers `deliver`.
+        async fn remote_pod(rs: &RendezvousServer, deliver: bool) -> (crate::presence::Presence, mpsc::UnboundedReceiver<Call>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(crate::internal::serve(listener, rs.cluster.token(), move |call| {
+                let tx = tx.clone();
+                async move { tx.send(call).is_ok() && deliver }
+            }));
+            let pod = crate::presence::Presence::new(rs.pm.db.pool().clone(), "hbbs-1".to_owned(), addr);
+            pod.start().await.unwrap();
+            (pod, rx)
+        }
+
+        fn punch_bytes(id: &str) -> Vec<u8> {
+            let mut msg = RendezvousMessage::new();
+            msg.set_punch_hole_request(PunchHoleRequest { id: id.to_owned(), ..Default::default() });
+            msg.write_to_bytes().unwrap()
+        }
+
+        #[tokio::test]
+        async fn punch_hole_for_a_device_on_another_pod_is_forwarded() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server().await;
+            let (pod1, mut calls) = remote_pod(&rs, true).await;
+            rs.pm.db.insert_peer("fwd_dev1", b"u", b"p", r#"{"ip":"10.1.2.3"}"#).await.unwrap();
+            pod1.register("fwd_dev1", 1).await;
+            let (sink, _client) = logged_in_only_tests::tcp_sink().await;
+            let mut sink = Some(sink);
+            let viewer: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+
+            let (keep, _) = rs.handle_tcp(&punch_bytes("fwd_dev1"), &mut sink, viewer, "", true).await;
+            assert!(keep);
+            match timeout(5000, calls.recv()).await.ok().flatten() {
+                Some(Call::Device { id, msg }) => {
+                    assert_eq!(id, "fwd_dev1");
+                    assert_eq!(AddrMangle::decode(&msg.punch_hole().socket_addr), viewer);
+                }
+                other => panic!("expected a device call, got {other:?}"),
+            }
+            assert!(rs.tcp_punch.lock().await.contains_key(&viewer), "the viewer keeps waiting for the device");
+        }
+
+        #[tokio::test]
+        async fn punch_hole_refused_by_the_holder_answers_offline() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server().await;
+            let (pod1, _calls) = remote_pod(&rs, false).await;
+            rs.pm.db.insert_peer("fwd_dev2", b"u", b"p", r#"{"ip":"10.1.2.3"}"#).await.unwrap();
+            pod1.register("fwd_dev2", 1).await;
+            let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
+            let mut sink = Some(sink);
+
+            rs.handle_tcp(&punch_bytes("fwd_dev2"), &mut sink, "192.168.1.1:1234".parse().unwrap(), "", true).await;
+            let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
+            let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
+            assert_eq!(reply.punch_hole_response().failure, punch_hole_response::Failure::OFFLINE.into());
+        }
+
+        #[tokio::test]
+        async fn punch_hole_for_a_device_on_a_dead_pod_is_offline() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server().await;
+            let (pod1, _calls) = remote_pod(&rs, true).await;
+            rs.pm.db.insert_peer("fwd_dev3", b"u", b"p", "{}").await.unwrap();
+            pod1.register("fwd_dev3", 1).await;
+            sqlx::query("UPDATE hbbs_pod SET alive_at = now() - interval '31 seconds' WHERE pod = 'hbbs-1'")
+                .execute(rs.pm.db.pool())
+                .await
+                .unwrap();
+            let ph = PunchHoleRequest { id: "fwd_dev3".to_owned(), ..Default::default() };
+            let (msg, to) = rs.handle_punch_hole_request("10.0.0.1:1234".parse().unwrap(), ph, "", true).await.unwrap();
+            assert!(to.is_none());
+            assert_eq!(msg.punch_hole_response().failure, punch_hole_response::Failure::OFFLINE.into());
+        }
+
+        #[tokio::test]
+        async fn punch_hole_for_a_remote_device_uses_its_stored_ip() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server().await;
+            let (pod1, _calls) = remote_pod(&rs, true).await;
+            rs.pm.db.insert_peer("fwd_dev4", b"u", b"p", r#"{"ip":"10.1.2.3"}"#).await.unwrap();
+            pod1.register("fwd_dev4", 1).await;
+            let ph = PunchHoleRequest { id: "fwd_dev4".to_owned(), ..Default::default() };
+            let (msg, to) = rs.handle_punch_hole_request("10.0.0.1:1234".parse().unwrap(), ph, "", true).await.unwrap();
+            assert!(msg.has_punch_hole());
+            assert_eq!(to, Some("10.1.2.3:0".parse().unwrap()));
+        }
+
+        #[tokio::test]
+        async fn request_relay_for_a_device_on_another_pod_is_forwarded() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, mut rx) = test_server().await;
+            let (pod1, mut calls) = remote_pod(&rs, true).await;
+            pod1.register("fwd_dev5", 1).await;
+            let viewer: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let mut msg = RendezvousMessage::new();
+            msg.set_request_relay(RequestRelay { id: "fwd_dev5".to_owned(), uuid: "fwd-uuid".to_owned(), ..Default::default() });
+            let mut sink = None;
+            rs.handle_tcp(&msg.write_to_bytes().unwrap(), &mut sink, viewer, "", true).await;
+            match timeout(5000, calls.recv()).await.ok().flatten() {
+                Some(Call::Device { id, msg }) => {
+                    assert_eq!(id, "fwd_dev5");
+                    assert_eq!(msg.request_relay().uuid, "fwd-uuid");
+                    assert_eq!(AddrMangle::decode(&msg.request_relay().socket_addr), viewer);
+                }
+                other => panic!("expected a device call, got {other:?}"),
+            }
+            assert!(rx.try_recv().is_err(), "no UDP fallback once the holder took it");
+        }
+
+        #[tokio::test]
+        async fn answers_for_another_pods_viewer_are_forwarded() {
+            let (mut rs, _rx) = test_server().await;
+            let (_pod1, mut calls) = remote_pod(&rs, true).await;
+            let viewer = crate::routing::RoutingTokens::new(1).tag("203.0.113.5:0".parse().unwrap());
+            let mut msg = RendezvousMessage::new();
+            msg.set_relay_response(RelayResponse { uuid: "fwd-uuid-3".to_owned(), ..Default::default() });
+            rs.send_to_tcp_sync(msg.clone(), viewer).await.unwrap();
+            assert_eq!(timeout(5000, calls.recv()).await.ok().flatten(), Some(Call::Viewer { addr: viewer, msg }));
+        }
+
+        #[tokio::test]
+        async fn online_states_combine_local_and_remote_devices() {
+            let (mut rs, _rx) = test_server().await;
+            let (pod1, _calls) = remote_pod(&rs, true).await;
+            register_peer(&mut rs, "on_local", "10.0.0.5:1").await;
+            pod1.register("on_remote", 1).await;
+            let peers = ["on_local".to_owned(), "on_remote".to_owned(), "on_none".to_owned()];
+            assert_eq!(&rs.online_states(&peers).await[..], &[0b1100_0000]);
         }
     }
 }
