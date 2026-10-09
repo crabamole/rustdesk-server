@@ -58,7 +58,12 @@ impl ClusterConfig {
         }
         let pod_ip = match get("POD_IP") {
             Some(v) => v.parse().context("invalid POD_IP")?,
-            None => IpAddr::from([127, 0, 0, 1]),
+            None => {
+                if get("POD_NAME").is_some() {
+                    log::warn!("POD_NAME is set but POD_IP is not; other pods cannot reach 127.0.0.1");
+                }
+                IpAddr::from([127, 0, 0, 1])
+            }
         };
         Ok(Self {
             pod,
