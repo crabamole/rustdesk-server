@@ -22,7 +22,7 @@ rustdesk-api.
 
 | Binary | Role | Ports |
 | --- | --- | --- |
-| `hbbs` | ID/rendezvous server | `21116` TCP+UDP (rendezvous), `21115` TCP (NAT test), `21118` TCP (WebSocket) |
+| `hbbs` | ID/rendezvous server | `21116` TCP+UDP (rendezvous), `21115` TCP (NAT test), `21118` TCP (WebSocket), `21120` TCP (pod-to-pod, cluster only), `21121` HTTP (`/livez`, `/readyz`) |
 | `hbbr` | Relay server | `21117` TCP (relay), `21119` TCP (WebSocket) |
 | `rustdesk-utils` | CLI utilities, e.g. `genkeypair` | — |
 
@@ -32,7 +32,7 @@ The NAT test and WebSocket ports follow the main port: `PORT - 1` and `PORT + 2`
 
 - **PostgreSQL**, shared with rustdesk-api. The api-server owns the schema:
   start it first against the same database. hbbs never creates or migrates tables;
-  at startup it waits until the schema exists.
+  it needs the `peer`, `hbbs_pod` and `peer_presence` tables and at startup waits until they exist.
 - **rustdesk-api**, reachable from hbbs (set its URL with `API_SERVER`). Required
   when `LOGGED_IN_ONLY=Y`; also used, best effort, for any request carrying a
   token so the connection can be attributed to the signed-in user.
@@ -96,8 +96,13 @@ file in the working directory, or in an INI file passed with `-c`.
 | | `API_SERVER` | rustdesk-api URL used to validate tokens (default `http://127.0.0.1:21114`) |
 | `--logged-in-only` | `LOGGED_IN_ONLY=Y` | Only logged-in clients may control peers |
 | | `ALWAYS_USE_RELAY=Y` | Disallow direct peer connections |
+| | `POD_NAME` | Pod name; its trailing number (0–31) is the pod's ordinal (default `hbbs-0`) |
+| | `POD_IP` | Address other hbbs pods reach this one on (default `127.0.0.1`) |
+| | `INTERNAL_PORT` | Pod-to-pod forwarding port (default `21120`); reachable from hbbs pods only |
+| | `HEALTH_PORT` | HTTP port for `/livez` and `/readyz` (default `21121`) |
+| | `KEEP_ALIVE_SECS` | Keep-alive sent to devices at registration (default `20`); a device drops a connection silent for 1.5 × this |
 | `-p, --port` | `PORT` | Rendezvous port (default `21116`) |
-| `-k, --key` | `KEY` | Only allow clients with this key. The default `-` uses the keypair in the working directory, generated on first start |
+| `-k, --key` | `KEY` | Only allow clients with this key. The default `-` uses the keypair in the working directory, generated on first start. hbbs needs the secret key (pod-to-pod calls authenticate with a token derived from it), so a bare public key is refused |
 | `-r, --relay-servers` | | Relay servers handed to clients, comma-separated |
 | `-R, --rendezvous-servers` | | Rendezvous servers, comma-separated |
 | `--mask` | | LAN range, e.g. `192.168.0.0/16`, used to detect LAN connections |

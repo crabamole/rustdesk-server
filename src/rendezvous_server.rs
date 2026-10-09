@@ -53,6 +53,7 @@ enum Data {
     Msg(Box<RendezvousMessage>, SocketAddr),
     RelayServers0(String),
     RelayServers(RelayServers),
+    Ping(mpsc::UnboundedSender<()>),
 }
 
 const REG_TIMEOUT: i64 = 30_000;
@@ -146,6 +147,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    cluster: Arc<crate::cluster::Cluster>,
 }
 
 enum LoopFailure {
@@ -161,7 +163,20 @@ impl RendezvousServer {
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
         let ws_port = port + 2;
+        let cfg = crate::cluster::ClusterConfig::from_env()?;
+        let probe = Arc::new(StartupProbe::default());
+        let health = crate::health::bind(cfg.health_port)?;
+        let serving = probe.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::health::serve(health, serving).await {
+                log::error!("health server stopped: {e}");
+            }
+        });
         let pm = PeerMap::new().await?;
+        let internal_listener = create_tcp_listener(cfg.internal_port as i32).await?;
+        let cluster = Arc::new(
+            crate::cluster::Cluster::start(&cfg, cfg.internal_port, pm.db.pool().clone(), internal_token(&sk)?).await?,
+        );
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         log::info!("Listening on tcp/udp :{}", port);
@@ -205,11 +220,13 @@ impl RendezvousServer {
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
+            cluster,
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        rs.spawn_cluster_tasks(internal_listener, probe);
         let mut listener = create_tcp_listener(port).await?;
         let mut listener2 = create_tcp_listener(nat_port).await?;
         let mut listener3 = create_tcp_listener(ws_port).await?;
@@ -317,6 +334,7 @@ impl RendezvousServer {
                         Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
+                        Data::Ping(reply) => { reply.send(()).ok(); }
                     }
                 }
                 res = socket.next() => {
@@ -578,12 +596,14 @@ impl RendezvousServer {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_register_pk_response(RegisterPkResponse {
                                 result: res.into(),
+                                keep_alive: self.cluster.keep_alive_secs,
                                 ..Default::default()
                             });
                             Self::send_to_sink(sink, msg_out).await;
                             if let Some(s) = sink.take() {
                                 let gen = WS_PEER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 self.ws_peers.lock().await.insert(id.clone(), (gen, s));
+                                self.cluster.presence.register(&id, gen).await;
                                 log::info!("Peer {} registered via TCP/WS (gen={})", id, gen);
                                 return (true, Some((id, gen)));
                             }
@@ -1400,7 +1420,8 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut sink;
         let mut reg_info: Option<(String, u64)> = None;
-        let heartbeat_interval = *WS_HEARTBEAT_INTERVAL;
+        // Devices drop a connection silent for 1.5 × keep_alive.
+        let heartbeat_interval = (*WS_HEARTBEAT_INTERVAL).min(self.cluster.keep_alive_secs as u64 * 1000);
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1535,6 +1556,9 @@ impl RendezvousServer {
                 }
             }
         }
+        if let Some((id, gen)) = &reg_info {
+            self.device_gone(id, *gen).await;
+        }
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         }
@@ -1639,12 +1663,133 @@ impl RendezvousServer {
     }
 }
 
+impl RendezvousServer {
+    fn spawn_cluster_tasks(&self, internal: TcpListener, probe: Arc<StartupProbe>) {
+        let rs = self.clone();
+        tokio::spawn(crate::internal::serve(internal, self.cluster.token(), move |call| {
+            let rs = rs.clone();
+            async move { rs.handle_internal(call).await }
+        }));
+        probe
+            .0
+            .set(ServerProbe {
+                tx: self.tx.clone(),
+                db: self.pm.db.clone(),
+                cluster: self.cluster.clone(),
+            })
+            .ok();
+        let rs = self.clone();
+        self.cluster.run_heartbeat(move || {
+            let rs = rs.clone();
+            async move { rs.presence_tick().await }
+        });
+    }
+
+    /// A database failover empties the UNLOGGED tables; the heartbeat notices and rewrites them.
+    async fn presence_tick(&self) {
+        if self.cluster.presence.heartbeat().await {
+            self.cluster.reassert(|| self.ws_devices()).await;
+        }
+    }
+
+    async fn ws_devices(&self) -> HashMap<String, u64> {
+        let ws_peers = self.ws_peers.lock().await;
+        ws_peers.iter().map(|(id, (gen, _))| (id.clone(), *gen)).collect()
+    }
+
+    /// Unless the device already reconnected here, other pods must stop routing it to this one.
+    async fn device_gone(&self, id: &str, gen: u64) {
+        self.cluster.presence.unregister(id, gen).await;
+        let reconnected = self.ws_peers.lock().await.contains_key(id);
+        if !reconnected {
+            self.pm.expire(id).await;
+        }
+    }
+
+    async fn handle_internal(&self, call: crate::internal::Call) -> bool {
+        match call {
+            crate::internal::Call::Device { id, msg } => self.send_to_ws_peer(&id, msg).await,
+            crate::internal::Call::Viewer { addr, msg } => {
+                let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+                if sink.is_none() {
+                    return false;
+                }
+                Self::send_to_sink(&mut sink, msg).await;
+                true
+            }
+        }
+    }
+}
+
+struct ServerProbe {
+    tx: Sender,
+    db: crate::database::Database,
+    cluster: Arc<crate::cluster::Cluster>,
+}
+
+#[async_trait::async_trait]
+impl crate::health::Probe for ServerProbe {
+    async fn live(&self) -> bool {
+        let (reply, mut answered) = mpsc::unbounded_channel();
+        self.tx.send(Data::Ping(reply)).is_ok()
+            && matches!(timeout(crate::health::PROBE_TIMEOUT_MS, answered.recv()).await, Ok(Some(())))
+    }
+
+    async fn ready(&self) -> bool {
+        !self.cluster.is_draining() && self.db.ping().await
+    }
+}
+
+/// Answers before the database is reachable: alive while waiting, ready only once the server runs.
+#[derive(Default)]
+struct StartupProbe(once_cell::sync::OnceCell<ServerProbe>);
+
+#[async_trait::async_trait]
+impl crate::health::Probe for StartupProbe {
+    async fn live(&self) -> bool {
+        match self.0.get() {
+            Some(p) => p.live().await,
+            None => true,
+        }
+    }
+
+    async fn ready(&self) -> bool {
+        match self.0.get() {
+            Some(p) => p.ready().await,
+            None => false,
+        }
+    }
+}
+
+/// Pod-to-pod calls carry a token only holders of the shared keypair can derive.
+fn internal_token(sk: &Option<sign::SecretKey>) -> ResultType<crate::internal::Token> {
+    match sk {
+        Some(sk) => Ok(crate::internal::token(&sk.0)),
+        None => bail!("hbbs needs its keypair (id_ed25519) to authenticate pod-to-pod calls"),
+    }
+}
+
+#[cfg(feature = "integration-test")]
+#[derive(Default)]
+pub struct TestOptions {
+    pub key: String,
+    /// Shared with other test servers to stand in for pods of one deployment; fresh when `None`.
+    pub db_url: Option<String>,
+    /// `hbbs-0` when empty.
+    pub pod: String,
+}
+
 #[cfg(feature = "integration-test")]
 pub struct TestServer {
     pub port: u16,
     pub udp_port: u16,
     pub nat_port: u16,
     pub ws_port: u16,
+    pub internal_port: u16,
+    pub health_port: u16,
+    pub db_url: String,
+    #[allow(dead_code)]
+    rs: RendezvousServer,
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -1658,8 +1803,27 @@ impl TestServer {
 #[cfg(feature = "integration-test")]
 impl RendezvousServer {
     pub async fn start_test(key: &str) -> ResultType<TestServer> {
-        let (key, sk) = Self::get_server_sk(key);
-        let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await?;
+        Self::start_test_with(TestOptions { key: key.to_owned(), ..Default::default() }).await
+    }
+
+    pub async fn start_test_with(opts: TestOptions) -> ResultType<TestServer> {
+        let (key, sk) = Self::get_server_sk(&opts.key);
+        let db_url = match opts.db_url {
+            Some(url) => url,
+            None => crate::testing::fresh_peer_database_url().await,
+        };
+        let db = crate::database::Database::new(&db_url).await?;
+        let pod = if opts.pod.is_empty() { "hbbs-0".to_owned() } else { opts.pod };
+        let cfg = crate::cluster::ClusterConfig::parse(|name| (name == "POD_NAME").then(|| pod.clone()))?;
+        let internal = create_tcp_listener(0).await?;
+        let internal_port = internal.local_addr()?.port();
+        let health = crate::health::bind(0)?;
+        let health_port = health.local_addr()?.port();
+        let probe = Arc::new(StartupProbe::default());
+        tokio::spawn(crate::health::serve(health, probe.clone()));
+        let cluster = Arc::new(
+            crate::cluster::Cluster::start(&cfg, internal_port, db.pool().clone(), internal_token(&sk)?).await?,
+        );
         let pm = PeerMap::new_with_db(db);
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
@@ -1681,7 +1845,9 @@ impl RendezvousServer {
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
+            cluster,
         };
+        rs.spawn_cluster_tasks(internal, probe);
 
         let mut socket = create_udp_listener(0, 0).await?;
         let udp_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -1693,7 +1859,7 @@ impl RendezvousServer {
         let ws_port = listener3.local_addr()?.port();
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
-
+        let handle = rs.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = rs.io_loop(&mut rx, &mut listener, &mut listener2, &mut listener3, &mut socket, &key) => {}
@@ -1706,6 +1872,10 @@ impl RendezvousServer {
             udp_port,
             nat_port,
             ws_port,
+            internal_port,
+            health_port,
+            db_url,
+            rs: handle,
             shutdown: shutdown_tx,
         })
     }
@@ -2087,9 +2257,15 @@ mod tests {
         }
     }
 
+    fn test_cluster(db: &crate::database::Database) -> Arc<crate::cluster::Cluster> {
+        let presence = crate::presence::Presence::new(db.pool().clone(), "hbbs-0".to_owned(), "127.0.0.1:1".to_owned());
+        Arc::new(crate::cluster::Cluster::new(presence, 0, 20, [7; 32]))
+    }
+
     async fn test_server() -> (RendezvousServer, Receiver) {
         let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
         let pm = PeerMap::new_with_db(db);
+        let cluster = test_cluster(&pm.db);
         let (tx, rx) = mpsc::unbounded_channel();
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
         let rs = RendezvousServer {
@@ -2110,6 +2286,7 @@ mod tests {
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
+            cluster,
         };
         (rs, rx)
     }
@@ -2572,6 +2749,7 @@ mod tests {
     async fn test_server_with_sk() -> (RendezvousServer, Receiver) {
         let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
         let pm = PeerMap::new_with_db(db);
+        let cluster = test_cluster(&pm.db);
         let (tx, rx) = mpsc::unbounded_channel();
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
         let (_pk, sk) = sign::gen_keypair();
@@ -2593,6 +2771,7 @@ mod tests {
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
+            cluster,
         };
         (rs, rx)
     }
@@ -3024,6 +3203,7 @@ mod tests {
             let _guard = EnvGuard::acquire().await;
             let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
             let pm = PeerMap::new_with_db(db);
+            let cluster = test_cluster(&pm.db);
             let (tx, rx) = mpsc::unbounded_channel();
             let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
             let (_pk, sk) = sign::gen_keypair();
@@ -3047,6 +3227,7 @@ mod tests {
                     secure_tcp_pk_b,
                     secure_tcp_sk_b,
                 }),
+                cluster,
             };
             register_peer(&mut rs, "lan_peer", "10.0.0.5:9999").await;
 
@@ -3067,6 +3248,7 @@ mod tests {
             let _guard = EnvGuard::acquire().await;
             let db = crate::database::Database::new(&crate::testing::fresh_peer_database_url().await).await.unwrap();
             let pm = PeerMap::new_with_db(db);
+            let cluster = test_cluster(&pm.db);
             let (tx, rx) = mpsc::unbounded_channel();
             let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
             let (_pk, sk) = sign::gen_keypair();
@@ -3090,6 +3272,7 @@ mod tests {
                     secure_tcp_pk_b,
                     secure_tcp_sk_b,
                 }),
+                cluster,
             };
             // Peer in LAN
             register_peer(&mut rs, "lan_peer2", "10.0.0.5:9999").await;
@@ -3620,7 +3803,7 @@ mod tests {
         }
 
         /// A sink whose frames can be read back from the returned stream.
-        async fn tcp_sink() -> (Sink, Framed<TcpStream, BytesCodec>) {
+        pub(super) async fn tcp_sink() -> (Sink, Framed<TcpStream, BytesCodec>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
             let (server, _) = listener.accept().await.unwrap();
@@ -3871,6 +4054,144 @@ mod tests {
                     assert!(rr.token.is_empty());
                 }
                 _ => panic!("RequestRelay was not forwarded"),
+            }
+        }
+    }
+
+    mod cluster_tests {
+        use super::*;
+        use crate::health::Probe as _;
+        use crate::internal::Call;
+
+        fn other_pod(rs: &RendezvousServer) -> crate::presence::Presence {
+            crate::presence::Presence::new(rs.pm.db.pool().clone(), "hbbs-1".to_owned(), "127.0.0.1:2".to_owned())
+        }
+
+        #[test]
+        fn internal_token_needs_the_keypair() {
+            assert!(internal_token(&None).is_err());
+            let (_pk, sk) = sign::gen_keypair();
+            assert_eq!(internal_token(&Some(sk.clone())).unwrap(), crate::internal::token(&sk.0));
+        }
+
+        #[tokio::test]
+        async fn probe_live_goes_through_the_event_loop() {
+            let (rs, mut rx) = test_server().await;
+            let probe = ServerProbe { tx: rs.tx.clone(), db: rs.pm.db.clone(), cluster: rs.cluster.clone() };
+            let answer = tokio::spawn(async move {
+                if let Some(Data::Ping(reply)) = rx.recv().await {
+                    reply.send(()).ok();
+                }
+            });
+            assert!(probe.live().await);
+            answer.await.unwrap();
+            assert!(!probe.live().await, "nobody answers once the loop is gone");
+        }
+
+        #[tokio::test]
+        async fn startup_probe_is_live_but_not_ready_before_the_server_runs() {
+            let probe = StartupProbe::default();
+            assert!(probe.live().await);
+            assert!(!probe.ready().await);
+            let (rs, _rx) = test_server().await;
+            probe.0.set(ServerProbe { tx: rs.tx.clone(), db: rs.pm.db.clone(), cluster: rs.cluster.clone() }).ok();
+            assert!(probe.ready().await);
+        }
+
+        #[tokio::test]
+        async fn probe_ready_needs_the_database_and_no_drain() {
+            let (rs, _rx) = test_server().await;
+            let probe = ServerProbe { tx: rs.tx.clone(), db: rs.pm.db.clone(), cluster: rs.cluster.clone() };
+            assert!(probe.ready().await);
+            rs.cluster.start_draining();
+            assert!(!probe.ready().await);
+
+            let (rs, _rx) = test_server().await;
+            let probe = ServerProbe { tx: rs.tx.clone(), db: rs.pm.db.clone(), cluster: rs.cluster.clone() };
+            rs.pm.db.pool().close().await;
+            assert!(!probe.ready().await);
+        }
+
+        #[tokio::test]
+        async fn presence_tick_rewrites_rows_after_the_tables_are_emptied() {
+            let (rs, _rx) = test_server().await;
+            rs.cluster.presence.start().await.unwrap();
+            let (sink, _client) = logged_in_only_tests::tcp_sink().await;
+            rs.ws_peers.lock().await.insert("tick_dev".to_owned(), (3, sink));
+            sqlx::query("TRUNCATE hbbs_pod, peer_presence").execute(rs.pm.db.pool()).await.unwrap();
+            rs.presence_tick().await;
+            let holder = other_pod(&rs).holder("tick_dev").await.map(|r| r.pod);
+            assert_eq!(holder.as_deref(), Some("hbbs-0"));
+        }
+
+        #[tokio::test]
+        async fn device_gone_clears_presence_and_liveness() {
+            let (mut rs, _rx) = test_server().await;
+            rs.cluster.presence.start().await.unwrap();
+            register_peer(&mut rs, "gone_dev", "10.0.0.5:5000").await;
+            rs.cluster.presence.register("gone_dev", 4).await;
+            rs.device_gone("gone_dev", 4).await;
+            assert!(other_pod(&rs).holder("gone_dev").await.is_none());
+            let peer = rs.pm.get_in_memory("gone_dev").await.unwrap();
+            assert!(peer.read().await.last_reg_time.elapsed().as_secs() >= 3599);
+        }
+
+        #[tokio::test]
+        async fn device_gone_keeps_a_newer_connection_live() {
+            let (mut rs, _rx) = test_server().await;
+            register_peer(&mut rs, "back_dev", "10.0.0.5:5000").await;
+            let (sink, _client) = logged_in_only_tests::tcp_sink().await;
+            rs.ws_peers.lock().await.insert("back_dev".to_owned(), (5, sink));
+            rs.device_gone("back_dev", 4).await;
+            let peer = rs.pm.get_in_memory("back_dev").await.unwrap();
+            assert!(peer.read().await.last_reg_time.elapsed().as_secs() < 5);
+        }
+
+        #[tokio::test]
+        async fn internal_call_reaches_a_waiting_viewer_once() {
+            let (rs, _rx) = test_server().await;
+            let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
+            let viewer: SocketAddr = "203.0.113.5:2049".parse().unwrap();
+            rs.tcp_punch.lock().await.insert(viewer, sink);
+            let mut msg = RendezvousMessage::new();
+            msg.set_relay_response(RelayResponse { uuid: "int-uuid".to_owned(), ..Default::default() });
+            assert!(rs.handle_internal(Call::Viewer { addr: viewer, msg: msg.clone() }).await);
+            let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
+            assert_eq!(RendezvousMessage::parse_from_bytes(&frame).unwrap(), msg);
+            assert!(!rs.handle_internal(Call::Viewer { addr: viewer, msg }).await);
+        }
+
+        #[tokio::test]
+        async fn internal_call_reaches_a_registered_device() {
+            let (rs, _rx) = test_server().await;
+            let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
+            rs.ws_peers.lock().await.insert("int_dev".to_owned(), (1, sink));
+            let mut msg = RendezvousMessage::new();
+            msg.set_punch_hole(PunchHole { relay_server: "wss://r".to_owned(), ..Default::default() });
+            assert!(rs.handle_internal(Call::Device { id: "int_dev".to_owned(), msg: msg.clone() }).await);
+            let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
+            assert_eq!(RendezvousMessage::parse_from_bytes(&frame).unwrap(), msg);
+            assert!(!rs.handle_internal(Call::Device { id: "nobody".to_owned(), msg }).await);
+        }
+
+        #[cfg(feature = "integration-test")]
+        #[tokio::test]
+        async fn pods_started_together_with_one_key_accept_each_others_calls() {
+            let (_pk, sk) = sign::gen_keypair();
+            let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sk.0);
+            let opts = |pod: &str, db_url: Option<String>| TestOptions { key: key.clone(), db_url, pod: pod.to_owned() };
+            let first = RendezvousServer::start_test_with(opts("hbbs-0", None)).await.unwrap();
+            let (a, b) = tokio::join!(
+                RendezvousServer::start_test_with(opts("hbbs-1", Some(first.db_url.clone()))),
+                RendezvousServer::start_test_with(opts("hbbs-2", Some(first.db_url.clone()))),
+            );
+            let (a, b) = (a.unwrap(), b.unwrap());
+            assert_eq!(a.rs.cluster.token(), b.rs.cluster.token());
+            let call = Call::Device { id: "nobody".to_owned(), msg: RendezvousMessage::new() };
+            let answered = crate::internal::call(&format!("127.0.0.1:{}", b.internal_port), &a.rs.cluster.token(), &call).await;
+            assert!(!answered.unwrap(), "a 404, not a rejected token");
+            for s in [first, a, b] {
+                s.shutdown();
             }
         }
     }
