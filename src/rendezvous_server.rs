@@ -6,7 +6,6 @@ use hbb_common::{
     bytes::{Bytes, BytesMut},
     bytes_codec::BytesCodec,
     config,
-    futures::future::join_all,
     futures_util::{
         sink::SinkExt,
         stream::{SplitSink, StreamExt},
@@ -40,7 +39,7 @@ use ipnetwork::Ipv4Network;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::Instant,
 };
@@ -51,7 +50,6 @@ use serde_json::json;
 #[derive(Clone, Debug)]
 enum Data {
     Msg(Box<RendezvousMessage>, SocketAddr),
-    RelayServers0(String),
     RelayServers(RelayServers),
     Ping(mpsc::UnboundedSender<()>),
 }
@@ -99,7 +97,6 @@ impl Encrypt {
 
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
-static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
@@ -144,7 +141,7 @@ pub struct RendezvousServer {
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
-    relay_servers0: Arc<RelayServers>,
+    relay_list: Arc<crate::relays::RelayList>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     cluster: Arc<crate::cluster::Cluster>,
@@ -208,7 +205,7 @@ impl RendezvousServer {
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
-            relay_servers0: Default::default(),
+            relay_list: Default::default(),
             rendezvous_servers: Arc::new(rendezvous_servers),
             inner: Arc::new(Inner {
                 serial,
@@ -225,7 +222,7 @@ impl RendezvousServer {
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
-        rs.parse_relay_servers(&get_arg("relay-servers"));
+        rs.set_relay_list(crate::relays::RelayList::from_env()?);
         rs.spawn_cluster_tasks(internal_listener, probe);
         let mut listener = create_tcp_listener(port).await?;
         let mut listener2 = create_tcp_listener(nat_port).await?;
@@ -321,18 +318,17 @@ impl RendezvousServer {
         loop {
             tokio::select! {
                 _ = timer_check_relay.tick() => {
-                    if self.relay_servers0.len() > 1 {
-                        let rs = self.relay_servers0.clone();
+                    if !self.relay_list.checks.is_empty() {
+                        let list = self.relay_list.clone();
                         let tx = self.tx.clone();
                         tokio::spawn(async move {
-                            check_relay_servers(rs, tx).await;
+                            tx.send(Data::RelayServers(list.healthy().await)).ok();
                         });
                     }
                 }
                 Some(data) = rx.recv() => {
                     match data {
                         Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
-                        Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
                         Data::Ping(reply) => { reply.send(()).ok(); }
                     }
@@ -545,13 +541,6 @@ impl RendezvousServer {
                         rr.set_pk(pk);
                     }
                     let mut msg_out = RendezvousMessage::new();
-                    if !rr.relay_server.is_empty() {
-                        if self.is_lan(addr_b) {
-                            rr.relay_server = self.inner.local_ip.clone();
-                        } else if rr.relay_server == self.inner.local_ip {
-                            rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
-                        }
-                    }
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                     return (true, None);
@@ -948,12 +937,8 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
-            let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
+            let relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
-                if peer_is_lan {
-                    // https://github.com/rustdesk/rustdesk-server/issues/24
-                    relay_server = self.inner.local_ip.clone()
-                }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
             let same_intranet: bool = !ws
@@ -1180,20 +1165,14 @@ impl RendezvousServer {
         true
     }
 
-    fn parse_relay_servers(&mut self, relay_servers: &str) {
-        let rs = get_servers(relay_servers, "relay-servers");
-        self.relay_servers0 = Arc::new(rs);
-        self.relay_servers = self.relay_servers0.clone();
+    fn set_relay_list(&mut self, list: crate::relays::RelayList) {
+        log::info!("relays: {:?}, checks: {:?}", list.urls, list.checks);
+        self.relay_servers = Arc::new(list.urls.clone());
+        self.relay_list = Arc::new(list);
     }
 
     fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
-        if self.relay_servers.is_empty() {
-            return "".to_owned();
-        } else if self.relay_servers.len() == 1 {
-            return self.relay_servers[0].clone();
-        }
-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
-        self.relay_servers[i].clone()
+        crate::relays::pick(&self.relay_servers)
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
@@ -1205,7 +1184,7 @@ impl RendezvousServer {
             Some("h") => {
                 res = format!(
                     "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-                    "relay-servers(rs) <separated by ,>",
+                    "relay-servers(rs)",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
@@ -1215,8 +1194,8 @@ impl RendezvousServer {
                 )
             }
             Some("relay-servers" | "rs") => {
-                if let Some(rs) = fds.next() {
-                    self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
+                if fds.next().is_some() {
+                    res = "relay servers come from RELAY_URLS\n".to_owned();
                 } else {
                     for ip in self.relay_servers.iter() {
                         let _ = writeln!(res, "{ip}");
@@ -1334,7 +1313,6 @@ impl RendezvousServer {
                     } else {
                         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
                     }
-                    self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
                 } else {
                     let _ = writeln!(
                         res,
@@ -1777,6 +1755,9 @@ pub struct TestOptions {
     pub db_url: Option<String>,
     /// `hbbs-0` when empty.
     pub pod: String,
+    pub relay_urls: Vec<String>,
+    /// Same length as `relay_urls`, or empty.
+    pub relay_checks: Vec<String>,
 }
 
 #[cfg(feature = "integration-test")]
@@ -1833,7 +1814,7 @@ impl RendezvousServer {
             pm,
             tx,
             relay_servers: Default::default(),
-            relay_servers0: Default::default(),
+            relay_list: Default::default(),
             rendezvous_servers: Arc::new(vec![]),
             inner: Arc::new(Inner {
                 serial: 1,
@@ -1847,6 +1828,7 @@ impl RendezvousServer {
             }),
             cluster,
         };
+        rs.set_relay_list(crate::relays::RelayList::parse(&opts.relay_urls.join(","), &opts.relay_checks.join(","))?);
         rs.spawn_cluster_tasks(internal, probe);
 
         let mut socket = create_udp_listener(0, 0).await?;
@@ -1878,33 +1860,6 @@ impl RendezvousServer {
             rs: handle,
             shutdown: shutdown_tx,
         })
-    }
-}
-
-async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
-    let mut futs = Vec::new();
-    let rs = Arc::new(Mutex::new(Vec::new()));
-    for x in rs0.iter() {
-        let mut host = x.to_owned();
-        if !host.contains(':') {
-            host = format!("{}:{}", host, config::RELAY_PORT);
-        }
-        let rs = rs.clone();
-        let x = x.clone();
-        futs.push(tokio::spawn(async move {
-            if FramedStream::new(&host, None, CHECK_RELAY_TIMEOUT)
-                .await
-                .is_ok()
-            {
-                rs.lock().await.push(x);
-            }
-        }));
-    }
-    join_all(futs).await;
-    log::debug!("check_relay_servers");
-    let rs = std::mem::take(&mut *rs.lock().await);
-    if !rs.is_empty() {
-        tx.send(Data::RelayServers(rs)).ok();
     }
 }
 
@@ -2231,29 +2186,68 @@ mod tests {
     mod relay_server_tests {
         use super::*;
 
-        #[test]
-        fn test_get_relay_server_empty_returns_empty() {
-            let relays: RelayServers = vec![];
-            assert!(relays.is_empty());
+        fn ips() -> (IpAddr, IpAddr) {
+            (IpAddr::from([1, 1, 1, 1]), IpAddr::from([2, 2, 2, 2]))
         }
 
-        #[test]
-        fn test_get_relay_server_single_returns_it() {
-            let relays: RelayServers = vec!["relay1.example.com".to_owned()];
-            assert_eq!(relays.len(), 1);
-            assert_eq!(relays[0], "relay1.example.com");
+        #[tokio::test]
+        async fn test_get_relay_server_empty_returns_empty() {
+            let (mut rs, _rx) = test_server().await;
+            rs.set_relay_list(Default::default());
+            let (a, b) = ips();
+            assert_eq!(rs.get_relay_server(a, b), "");
         }
 
-        #[test]
-        fn test_relay_rotation_wraps_around() {
-            let relays = vec!["r1".to_owned(), "r2".to_owned(), "r3".to_owned()];
-            ROTATION_RELAY_SERVER.store(0, Ordering::SeqCst);
-            for round in 0..2 {
-                for j in 0..3 {
-                    let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % relays.len();
-                    assert_eq!(i, j, "round={round}");
-                }
-            }
+        #[tokio::test]
+        async fn test_get_relay_server_picks_among_handed_out_relays() {
+            let (mut rs, _rx) = test_server().await;
+            rs.set_relay_list(crate::relays::RelayList::parse("wss://h/ws/relay/0,wss://h/ws/relay/1", "").unwrap());
+            let (a, b) = ips();
+            let seen: std::collections::HashSet<String> = (0..200).map(|_| rs.get_relay_server(a, b)).collect();
+            assert_eq!(seen.len(), 2);
+        }
+
+        /// The handed-out relay must stay a `RELAY_URLS` entry even with `MASK` set.
+        fn lan_server(rs: &mut RendezvousServer) {
+            rs.inner = Arc::new(Inner {
+                mask: Some("10.0.0.0/24".parse().unwrap()),
+                local_ip: "10.0.0.100".to_owned(),
+                ..(*rs.inner).clone()
+            });
+        }
+
+        #[tokio::test]
+        async fn lan_device_still_gets_a_relay_url() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server().await;
+            lan_server(&mut rs);
+            rs.set_relay_list(crate::relays::RelayList::parse("wss://h/ws/relay/0", "").unwrap());
+            register_peer(&mut rs, "lan_tgt", "10.0.0.5:9999").await;
+            let ph = PunchHoleRequest { id: "lan_tgt".to_owned(), ..Default::default() };
+            let viewer: SocketAddr = "192.168.1.100:1234".parse().unwrap();
+            let (msg, _) = rs.handle_punch_hole_request(viewer, ph, "", false).await.unwrap();
+            assert_eq!(msg.punch_hole().relay_server, "wss://h/ws/relay/0");
+        }
+
+        #[tokio::test]
+        async fn relay_response_keeps_the_relay_for_a_lan_viewer() {
+            let (mut rs, _rx) = test_server().await;
+            lan_server(&mut rs);
+            let viewer: SocketAddr = "10.0.0.10:1234".parse().unwrap();
+            let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
+            rs.tcp_punch.lock().await.insert(try_into_v4(viewer), sink);
+            let mut msg = RendezvousMessage::new();
+            msg.set_relay_response(RelayResponse {
+                socket_addr: AddrMangle::encode(viewer).into(),
+                relay_server: "wss://h/ws/relay/0".to_owned(),
+                ..Default::default()
+            });
+            let device: SocketAddr = "10.0.0.5:7000".parse().unwrap();
+            let mut no_sink = None;
+            assert!(rs.handle_tcp(&msg.write_to_bytes().unwrap(), &mut no_sink, device, "", false).await.0);
+            let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
+            let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
+            assert_eq!(reply.relay_response().relay_server, "wss://h/ws/relay/0");
         }
     }
 
@@ -2274,7 +2268,7 @@ mod tests {
             pm,
             tx,
             relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
-            relay_servers0: Default::default(),
+            relay_list: Default::default(),
             rendezvous_servers: Arc::new(vec![]),
             inner: Arc::new(Inner {
                 serial: 1,
@@ -2710,11 +2704,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_relay_servers_set() {
-            let (rs, _rx) = test_server().await;
+        async fn test_relay_servers_cannot_be_set() {
+            let (rs, mut rx) = test_server().await;
             let result = rs.check_cmd("rs new-relay.com").await;
-            // Setting relay servers sends data via tx, no output
-            assert!(result.is_empty());
+            assert!(result.contains("RELAY_URLS"), "{result}");
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn test_always_use_relay_keeps_the_relay_list() {
+            let (rs, mut rx) = test_server().await;
+            rs.check_cmd("aur N").await;
+            assert!(rx.try_recv().is_err(), "aur must not replace the relay list");
         }
 
         #[tokio::test]
@@ -2759,7 +2760,7 @@ mod tests {
             pm,
             tx,
             relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
-            relay_servers0: Default::default(),
+            relay_list: Default::default(),
             rendezvous_servers: Arc::new(vec![]),
             inner: Arc::new(Inner {
                 serial: 1,
@@ -2956,22 +2957,16 @@ mod tests {
         }
     }
 
-    mod parse_relay_servers_tests {
+    mod set_relay_list_tests {
         use super::*;
 
         #[tokio::test]
-        async fn test_parse_sets_relay_servers() {
+        async fn test_set_relay_list_hands_out_all_urls_until_checked() {
             let (mut rs, _rx) = test_server().await;
-            rs.parse_relay_servers("relay1.com,relay2.com");
-            assert_eq!(rs.relay_servers.len(), 2);
-            assert_eq!(rs.relay_servers0.len(), 2);
-        }
-
-        #[tokio::test]
-        async fn test_parse_empty_clears_servers() {
-            let (mut rs, _rx) = test_server().await;
-            rs.parse_relay_servers("");
-            assert!(rs.relay_servers.is_empty());
+            let list = crate::relays::RelayList::parse("wss://a,wss://b", "http://a/readyz,http://b/readyz").unwrap();
+            rs.set_relay_list(list.clone());
+            assert_eq!(*rs.relay_servers, list.urls);
+            assert_eq!(*rs.relay_list, list);
         }
     }
 
@@ -3215,7 +3210,7 @@ mod tests {
                 pm,
                 tx,
                 relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
-                relay_servers0: Default::default(),
+                relay_list: Default::default(),
                 rendezvous_servers: Arc::new(vec![]),
                 inner: Arc::new(Inner {
                     serial: 1,
@@ -3260,7 +3255,7 @@ mod tests {
                 pm,
                 tx,
                 relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
-                relay_servers0: Default::default(),
+                relay_list: Default::default(),
                 rendezvous_servers: Arc::new(vec![]),
                 inner: Arc::new(Inner {
                     serial: 1,
@@ -4179,7 +4174,7 @@ mod tests {
         async fn pods_started_together_with_one_key_accept_each_others_calls() {
             let (_pk, sk) = sign::gen_keypair();
             let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sk.0);
-            let opts = |pod: &str, db_url: Option<String>| TestOptions { key: key.clone(), db_url, pod: pod.to_owned() };
+            let opts = |pod: &str, db_url: Option<String>| TestOptions { key: key.clone(), db_url, pod: pod.to_owned(), ..Default::default() };
             let first = RendezvousServer::start_test_with(opts("hbbs-0", None)).await.unwrap();
             let (a, b) = tokio::join!(
                 RendezvousServer::start_test_with(opts("hbbs-1", Some(first.db_url.clone()))),

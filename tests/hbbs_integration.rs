@@ -6,6 +6,34 @@ use hbb_common::{
 };
 use std::time::Duration;
 
+/// Runs a loopback admin command on the NAT-test port and returns its output.
+async fn admin(port: u16, cmd: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    s.write_all(cmd.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    timeout(Duration::from_secs(3), s.read_to_string(&mut out)).await.unwrap().unwrap();
+    out
+}
+
+/// An HTTP server answering every request with `status`.
+async fn http_stub(status: u16) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let resp = format!("HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
 async fn send_recv_udp(
     socket: &UdpSocket,
     msg: &RendezvousMessage,
@@ -1013,37 +1041,32 @@ async fn test_admin_cmd_set_always_use_relay() {
 
 #[tokio::test]
 async fn test_admin_cmd_set_relay_servers() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+    let server = hbbs::RendezvousServer::start_test_with(hbbs::TestOptions {
+        relay_urls: vec!["wss://h/ws/relay/0".to_owned()],
+        ..Default::default()
+    })
+    .await
+    .expect("start test server");
+    assert!(admin(server.nat_port, "rs wss://other/ws/relay/9").await.contains("RELAY_URLS"));
+    assert_eq!(admin(server.nat_port, "rs").await, "wss://h/ws/relay/0\n");
+    server.shutdown();
+}
 
-    let server = hbbs::RendezvousServer::start_test("")
-        .await
-        .expect("start test server");
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", server.port))
-        .await
-        .unwrap();
-    stream.write_all(b"rs 127.0.0.1:21117").await.unwrap();
-
-    let mut buf = vec![0u8; 4096];
-    let _result = timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
-    drop(stream);
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", server.port))
-        .await
-        .unwrap();
-    stream.write_all(b"rs").await.unwrap();
-
-    let mut buf = vec![0u8; 4096];
-    let result = timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
-    if let Ok(Ok(n)) = result {
-        let response = std::str::from_utf8(&buf[..n]).unwrap();
-        assert!(
-            response.contains("127.0.0.1:21117"),
-            "Should contain the set relay server"
-        );
+#[tokio::test]
+async fn test_relay_checks_steer_the_relay_handed_out() {
+    let up = http_stub(200).await;
+    let down = http_stub(503).await;
+    let server = hbbs::RendezvousServer::start_test_with(hbbs::TestOptions {
+        relay_urls: vec!["wss://h/ws/relay/0".to_owned(), "wss://h/ws/relay/1".to_owned()],
+        relay_checks: vec![format!("{up}/readyz"), format!("{down}/readyz")],
+        ..Default::default()
+    })
+    .await
+    .expect("start test server");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    for _ in 0..20 {
+        assert_eq!(admin(server.nat_port, "tg 1.1.1.1 2.2.2.2").await, "\"wss://h/ws/relay/0\"");
     }
-
     server.shutdown();
 }
 

@@ -7,6 +7,7 @@ mod health;
 mod internal;
 mod peer;
 mod presence;
+mod relays;
 pub mod relay_server;
 pub(crate) mod retry;
 mod routing;

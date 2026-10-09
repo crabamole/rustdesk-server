@@ -23,6 +23,7 @@ async fn start(pod: &str, db_url: Option<String>) -> TestServer {
         key: KEY.to_owned(),
         pod: pod.to_owned(),
         db_url,
+        ..Default::default()
     })
     .await
     .expect("start test server")
