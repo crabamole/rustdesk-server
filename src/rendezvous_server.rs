@@ -1421,8 +1421,10 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut sink;
         let mut reg_info: Option<(String, u64)> = None;
-        // Devices drop a connection silent for 1.5 × keep_alive.
+        // Devices drop a connection silent for 1.5 × keep_alive; so do we, as they echo each keep-alive.
         let heartbeat_interval = (*WS_HEARTBEAT_INTERVAL).min(self.cluster.keep_alive_secs as u64 * 1000);
+        let silence_limit = self.cluster.keep_alive_secs as u64 * 1500;
+        let mut last_recv = Instant::now();
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1444,8 +1446,13 @@ impl RendezvousServer {
             });
             let mut read_timeout: u64 = 30_000;
             loop {
-                match timeout(read_timeout, b.next()).await {
+                let wait = match reg_info {
+                    Some(_) => read_timeout.min(silence_limit.saturating_sub(last_recv.elapsed().as_millis() as u64)),
+                    None => read_timeout,
+                };
+                match timeout(wait, b.next()).await {
                     Ok(Some(Ok(msg))) => {
+                        last_recv = Instant::now();
                         if let tungstenite::Message::Binary(bytes) = msg {
                             let (keep_going, info) = if bytes.is_empty() {
                                 (true, None) // keep-alive echo
@@ -1470,9 +1477,9 @@ impl RendezvousServer {
                     Ok(Some(Err(_))) | Ok(None) => break,
                     Err(_) => {
                         if let Some((ref id, gen)) = reg_info {
-                            if let Some(peer) = self.pm.get_in_memory(id).await {
-                                let mut w = peer.write().await;
-                                w.last_reg_time = Instant::now();
+                            if last_recv.elapsed().as_millis() as u64 >= silence_limit {
+                                log::info!("Peer {} silent for {}ms, closing", id, silence_limit);
+                                break;
                             }
                             if !self.send_keep_alive(&mut sink, id, gen).await {
                                 break;
@@ -1496,8 +1503,13 @@ impl RendezvousServer {
             }
             let mut read_timeout: u64 = 30_000;
             loop {
-                match timeout(read_timeout, b.next()).await {
+                let wait = match reg_info {
+                    Some(_) => read_timeout.min(silence_limit.saturating_sub(last_recv.elapsed().as_millis() as u64)),
+                    None => read_timeout,
+                };
+                match timeout(wait, b.next()).await {
                     Ok(Some(Ok(mut bytes))) => {
+                        last_recv = Instant::now();
                         if bytes.is_empty() {
                             // Keep-alive echo: never encrypted.
                             if let Some((ref id, _)) = reg_info {
@@ -1536,9 +1548,9 @@ impl RendezvousServer {
                     Ok(Some(Err(_))) | Ok(None) => break,
                     Err(_) => {
                         if let Some((ref id, gen)) = reg_info {
-                            if let Some(peer) = self.pm.get_in_memory(id).await {
-                                let mut w = peer.write().await;
-                                w.last_reg_time = Instant::now();
+                            if last_recv.elapsed().as_millis() as u64 >= silence_limit {
+                                log::info!("Peer {} silent for {}ms, closing", id, silence_limit);
+                                break;
                             }
                             if !self.send_keep_alive(&mut sink, id, gen).await {
                                 break;
@@ -1832,6 +1844,8 @@ pub struct TestOptions {
     pub relay_urls: Vec<String>,
     /// Same length as `relay_urls`, or empty.
     pub relay_checks: Vec<String>,
+    /// 20 when 0.
+    pub keep_alive_secs: i32,
 }
 
 #[cfg(feature = "integration-test")]
@@ -1873,7 +1887,12 @@ impl RendezvousServer {
         };
         let db = crate::database::Database::new(&db_url).await?;
         let pod = if opts.pod.is_empty() { "hbbs-0".to_owned() } else { opts.pod };
-        let cfg = crate::cluster::ClusterConfig::parse(|name| (name == "POD_NAME").then(|| pod.clone()))?;
+        let keep_alive = opts.keep_alive_secs.to_string();
+        let cfg = crate::cluster::ClusterConfig::parse(|name| match name {
+            "POD_NAME" => Some(pod.clone()),
+            "KEEP_ALIVE_SECS" if opts.keep_alive_secs > 0 => Some(keep_alive.clone()),
+            _ => None,
+        })?;
         let internal = create_tcp_listener(0).await?;
         let internal_port = internal.local_addr()?.port();
         let health = crate::health::bind(0)?;
