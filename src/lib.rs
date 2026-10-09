@@ -1,6 +1,7 @@
 mod rendezvous_server;
 pub use rendezvous_server::*;
 pub mod common;
+mod cluster;
 mod database;
 mod health;
 mod internal;
