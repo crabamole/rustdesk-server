@@ -136,6 +136,9 @@ Several hbbs processes can share one database, e.g. as the pods of a Kubernetes 
   device's answer, wherever it arrives, is passed back to the pod holding the viewer. Only hbbs pods
   must reach that port.
 - `OnlineRequest` on `/ws/id` is answered from presence across all pods.
+- Every viewer's port is replaced by a routing token naming its pod, so clients on raw TCP 21116 always
+  use the relay: the port in `PunchHole`/`PunchHoleResponse` and in `TestNatResponse` is that token.
+  WebSocket clients behind the proxy are unaffected; their port was never usable for punching.
 - The per-IP registration limits (`IP_BLOCK_PER_MINUTE`, `IP_BLOCK_IDS_PER_DAY`) count per pod, so the
   effective limit is the number of pods times the setting.
 

@@ -3426,8 +3426,8 @@ mod tests {
         #[tokio::test]
         async fn test_handle_hole_sent_via_tcp() {
             let (mut rs, mut rx) = test_server().await;
-            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let addr_a: SocketAddr = "10.0.0.1:1500".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:1700".parse().unwrap();
 
             let phs = PunchHoleSent {
                 socket_addr: AddrMangle::encode(addr_a).into(),
@@ -3468,8 +3468,8 @@ mod tests {
         #[tokio::test]
         async fn test_handle_local_addr_via_tcp() {
             let (mut rs, mut rx) = test_server().await;
-            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let addr_a: SocketAddr = "10.0.0.1:1500".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:1700".parse().unwrap();
 
             let la = LocalAddr {
                 socket_addr: AddrMangle::encode(addr_a).into(),
@@ -3693,8 +3693,8 @@ mod tests {
         #[tokio::test]
         async fn test_handle_tcp_punch_hole_sent() {
             let (mut rs, _rx) = test_server().await;
-            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let addr_a: SocketAddr = "10.0.0.1:1500".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:1700".parse().unwrap();
             let mut sink = None;
 
             let mut msg = RendezvousMessage::new();
@@ -3712,8 +3712,8 @@ mod tests {
         #[tokio::test]
         async fn test_handle_tcp_local_addr() {
             let (mut rs, _rx) = test_server().await;
-            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let addr_a: SocketAddr = "10.0.0.1:1500".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:1700".parse().unwrap();
             let mut sink = None;
 
             let mut msg = RendezvousMessage::new();
@@ -3732,8 +3732,8 @@ mod tests {
         #[tokio::test]
         async fn test_handle_tcp_relay_response() {
             let (mut rs, _rx) = test_server().await;
-            let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-            let addr_b: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let addr_a: SocketAddr = "10.0.0.1:1500".parse().unwrap();
+            let addr_b: SocketAddr = "10.0.0.2:1700".parse().unwrap();
             let mut sink = None;
 
             let mut msg = RendezvousMessage::new();
@@ -4289,7 +4289,7 @@ mod tests {
         async fn punch_hole_refused_by_the_holder_answers_offline() {
             let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
-            let (pod1, _calls) = remote_pod(&rs, false).await;
+            let (pod1, mut calls) = remote_pod(&rs, false).await;
             rs.pm.db.insert_peer("fwd_dev2", b"u", b"p", r#"{"ip":"10.1.2.3"}"#).await.unwrap();
             pod1.register("fwd_dev2", 1).await;
             let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
@@ -4299,6 +4299,8 @@ mod tests {
             let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
             let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
             assert_eq!(reply.punch_hole_response().failure, punch_hole_response::Failure::OFFLINE.into());
+            let call = timeout(5000, calls.recv()).await.ok().flatten();
+            assert!(matches!(call, Some(Call::Device { .. })), "the holder was asked first, got {call:?}");
         }
 
         #[tokio::test]

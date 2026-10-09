@@ -253,3 +253,29 @@ async fn online_request_over_ws_sees_other_pods() {
     pod0.shutdown();
     pod1.shutdown();
 }
+
+#[tokio::test]
+async fn punch_hole_answer_reaches_a_viewer_on_the_same_pod() {
+    let pod0 = start("hbbs-0", None).await;
+    let (_dw, mut dr, _) = device(pod0.ws_port, "clu_local1").await;
+    assert!(presence_pod(&pod0.db_url, "clu_local1").await.is_some());
+
+    let (mut vw, mut vr) = connect(pod0.ws_port).await;
+    let mut req = RendezvousMessage::new();
+    req.set_punch_hole_request(PunchHoleRequest {
+        id: "clu_local1".to_owned(),
+        licence_key: PK.to_owned(),
+        ..Default::default()
+    });
+    send(&mut vw, req).await;
+
+    let ph = recv(&mut dr).await;
+    assert!(ph.has_punch_hole(), "{ph:?}");
+    let viewer = hbb_common::AddrMangle::decode(&ph.punch_hole().socket_addr);
+    assert_eq!(viewer.port() >> 11, 0, "the token names hbbs-0");
+
+    let (mut aw, _ar) = connect(pod0.ws_port).await;
+    send(&mut aw, relay_answer(ph.punch_hole().socket_addr.clone(), "clu-uuid-4", "clu_local1")).await;
+    assert_eq!(recv(&mut vr).await.relay_response().uuid, "clu-uuid-4");
+    pod0.shutdown();
+}
