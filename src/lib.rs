@@ -3,6 +3,7 @@ pub use rendezvous_server::*;
 pub mod common;
 mod database;
 mod peer;
+mod presence;
 pub mod relay_server;
 pub(crate) mod retry;
 mod routing;
