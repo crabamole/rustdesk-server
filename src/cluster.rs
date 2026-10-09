@@ -21,6 +21,8 @@ use std::{
 
 /// Longer than a healthy heartbeat tick; a hung database must not hold up shutdown.
 const HEARTBEAT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Drain must finish within the pod's grace period even when the database hangs.
+const PRESENCE_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ClusterConfig {
@@ -169,7 +171,9 @@ impl Cluster {
                 }
             }
         }
-        self.presence.stop().await;
+        if tokio::time::timeout(PRESENCE_STOP_TIMEOUT, self.presence.stop()).await.is_err() {
+            log::warn!("presence cleanup still busy after {PRESENCE_STOP_TIMEOUT:?}; rows expire with the pod");
+        }
     }
 
     /// Rewrites this pod's presence from `devices()`. Connections that came or went meanwhile
@@ -252,6 +256,27 @@ mod tests {
     fn cfg(vars: &[(&str, &str)]) -> ResultType<ClusterConfig> {
         let vars: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         ClusterConfig::parse(|name| vars.get(name).cloned())
+    }
+
+    #[tokio::test]
+    async fn stop_gives_up_on_a_database_that_never_answers() {
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("postgres://u:p@{}/db", silent.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = silent.accept().await {
+                conns.push(c);
+            }
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(60))
+            .connect_lazy(&url)
+            .unwrap();
+        let cluster = Cluster::new(Presence::new(pool, "hbbs-0".to_owned(), "127.0.0.1:1".to_owned()), 0, 20, [7; 32]);
+        let stopped = tokio::time::timeout(Duration::from_secs(8), cluster.stop()).await;
+        assert!(stopped.is_ok(), "stop waited on the database");
+        assert!(cluster.is_draining());
+        held.abort();
     }
 
     #[test]
