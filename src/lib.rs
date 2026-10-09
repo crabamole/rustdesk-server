@@ -5,6 +5,7 @@ mod database;
 mod peer;
 pub mod relay_server;
 pub(crate) mod retry;
+mod routing;
 #[cfg(any(test, feature = "integration-test"))]
 pub mod testing;
 mod version;
