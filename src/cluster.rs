@@ -149,7 +149,8 @@ impl Cluster {
     }
 
     /// The heartbeat finishes first, or it would write the pod row of a draining pod back;
-    /// a hung one is cut off so shutdown still deletes the rows.
+    /// a hung one is cut off, so the row delete is best effort (an in-flight write may still
+    /// commit and then expires within the 30 s liveness window).
     pub(crate) async fn stop(&self) {
         self.start_draining();
         let task = self.heartbeat.lock().ok().and_then(|mut h| h.take());

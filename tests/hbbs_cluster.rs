@@ -279,3 +279,27 @@ async fn punch_hole_answer_reaches_a_viewer_on_the_same_pod() {
     assert_eq!(recv(&mut vr).await.relay_response().uuid, "clu-uuid-4");
     pod0.shutdown();
 }
+
+#[tokio::test]
+async fn drain_moves_devices_and_fails_readiness() {
+    let server = start("hbbs-0", None).await;
+    let (_dw, mut dr, _) = device(server.ws_port, "clu_drain1").await;
+    assert!(presence_pod(&server.db_url, "clu_drain1").await.is_some());
+
+    server.drain().await;
+    match timeout(Duration::from_secs(5), dr.next()).await {
+        Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {}
+        other => panic!("device connection still open: {other:?}"),
+    }
+    let pool = sqlx::PgPool::connect(&server.db_url).await.unwrap();
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM peer_presence WHERE pod = 'hbbs-0') + (SELECT count(*) FROM hbbs_pod WHERE pod = 'hbbs-0')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+    assert_eq!(http_status(server.health_port, "/readyz").await, 503);
+    assert_eq!(http_status(server.health_port, "/livez").await, 200);
+    server.shutdown();
+}

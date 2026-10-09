@@ -265,6 +265,7 @@ impl RendezvousServer {
                 }
             });
         };
+        let shutdown = rs.clone();
         let main_task = async move {
             loop {
                 log::info!("Start");
@@ -299,10 +300,12 @@ impl RendezvousServer {
             }
         };
         let listen_signal = listen_signal();
-        tokio::select!(
+        let res = tokio::select!(
             res = main_task => res,
             res = listen_signal => res,
-        )
+        );
+        shutdown.drain().await;
+        res
     }
 
     async fn io_loop(
@@ -1664,6 +1667,15 @@ impl RendezvousServer {
 }
 
 impl RendezvousServer {
+    /// Readiness fails and presence goes before the connections close, so devices that
+    /// reconnect elsewhere at once are not routed back here.
+    async fn drain(&self) {
+        self.cluster.stop().await;
+        let devices: Vec<Sink> = self.ws_peers.lock().await.drain().map(|(_, (_, sink))| sink).collect();
+        log::info!("draining: closing {} device connections", devices.len());
+        hbb_common::futures::future::join_all(devices.into_iter().map(close_sink)).await;
+    }
+
     fn spawn_cluster_tasks(&self, internal: TcpListener, probe: Arc<StartupProbe>) {
         let rs = self.clone();
         tokio::spawn(crate::internal::serve(internal, self.cluster.token(), move |call| {
@@ -1799,6 +1811,16 @@ async fn stored_addr(peer: &LockPeer) -> SocketAddr {
     SocketAddr::new(ip, 0)
 }
 
+async fn close_sink(mut sink: Sink) {
+    let closed = match &mut sink.tx {
+        SinkType::TcpStream(s) => timeout(1_000, s.close()).await.map(|r| r.is_ok()),
+        SinkType::Ws(ws) => timeout(1_000, ws.close()).await.map(|r| r.is_ok()),
+    };
+    if !matches!(closed, Ok(true)) {
+        log::debug!("closing a device connection failed");
+    }
+}
+
 #[cfg(feature = "integration-test")]
 #[derive(Default)]
 pub struct TestOptions {
@@ -1821,7 +1843,6 @@ pub struct TestServer {
     pub internal_port: u16,
     pub health_port: u16,
     pub db_url: String,
-    #[allow(dead_code)]
     rs: RendezvousServer,
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -1830,6 +1851,11 @@ pub struct TestServer {
 impl TestServer {
     pub fn shutdown(self) {
         let _ = self.shutdown.send(());
+    }
+
+    /// The SIGTERM path; the server keeps answering health checks afterwards.
+    pub async fn drain(&self) {
+        self.rs.drain().await;
     }
 }
 
@@ -4112,6 +4138,21 @@ mod tests {
 
         fn other_pod(rs: &RendezvousServer) -> crate::presence::Presence {
             crate::presence::Presence::new(rs.pm.db.pool().clone(), "hbbs-1".to_owned(), "127.0.0.1:2".to_owned())
+        }
+
+        #[tokio::test]
+        async fn drain_closes_devices_and_clears_presence() {
+            let (rs, _rx) = test_server().await;
+            rs.cluster.presence.start().await.unwrap();
+            let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
+            rs.ws_peers.lock().await.insert("drain_dev".to_owned(), (1, sink));
+            rs.cluster.presence.register("drain_dev", 1).await;
+
+            rs.drain().await;
+            assert!(rs.cluster.is_draining());
+            assert!(rs.ws_peers.lock().await.is_empty());
+            assert!(timeout(5000, client.next()).await.unwrap().is_none(), "the device sees its connection end");
+            assert!(other_pod(&rs).holder("drain_dev").await.is_none());
         }
 
         #[test]
