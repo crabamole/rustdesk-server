@@ -13,6 +13,16 @@ const UPSERT_POD: &str = "INSERT INTO hbbs_pod (pod, addr, epoch, alive_at) \
     VALUES ($1, $2, $3::uuid, now()) \
     ON CONFLICT (pod) DO UPDATE SET addr = EXCLUDED.addr, epoch = EXCLUDED.epoch, alive_at = now()";
 
+/// Upsert that leaves rows of newer own connections and of live pods alone.
+const CLAIM: &str = "INSERT INTO peer_presence (id, pod, epoch, gen) \
+    SELECT t.id, $2, $3::uuid, t.gen FROM UNNEST($1::text[], $4::bigint[]) AS t(id, gen) \
+    ON CONFLICT (id) DO UPDATE SET pod = EXCLUDED.pod, epoch = EXCLUDED.epoch, \
+    gen = EXCLUDED.gen, since = now() \
+    WHERE (peer_presence.pod = EXCLUDED.pod AND peer_presence.epoch = EXCLUDED.epoch \
+           AND peer_presence.gen <= EXCLUDED.gen) \
+       OR NOT EXISTS (SELECT 1 FROM hbbs_pod h WHERE h.pod = peer_presence.pod \
+           AND h.epoch = peer_presence.epoch AND h.alive_at > now() - interval '30 seconds')";
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PodRow {
     pub(crate) pod: String,
@@ -152,22 +162,13 @@ impl Presence {
         let gens: Vec<i64> = devices.iter().map(|(_, gen)| gen_i64(*gen)).collect();
         let res = async {
         let mut tx = self.pool.begin().await?;
-        let upserted = sqlx::query(
-            "INSERT INTO peer_presence (id, pod, epoch, gen) \
-             SELECT t.id, $2, $3::uuid, t.gen FROM UNNEST($1::text[], $4::bigint[]) AS t(id, gen) \
-             ON CONFLICT (id) DO UPDATE SET pod = EXCLUDED.pod, epoch = EXCLUDED.epoch, \
-             gen = EXCLUDED.gen, since = now() \
-             WHERE (peer_presence.pod = EXCLUDED.pod AND peer_presence.epoch = EXCLUDED.epoch \
-                    AND peer_presence.gen <= EXCLUDED.gen) \
-                OR NOT EXISTS (SELECT 1 FROM hbbs_pod h WHERE h.pod = peer_presence.pod \
-                    AND h.epoch = peer_presence.epoch AND h.alive_at > now() - interval '30 seconds')",
-        )
-        .bind(&ids)
-        .bind(&self.pod)
-        .bind(&self.epoch)
-        .bind(gens)
-        .execute(&mut *tx)
-        .await?;
+        let upserted = sqlx::query(CLAIM)
+            .bind(&ids)
+            .bind(&self.pod)
+            .bind(&self.epoch)
+            .bind(&gens)
+            .execute(&mut *tx)
+            .await?;
         // Rows of connections that ended while a delete failed.
         sqlx::query("DELETE FROM peer_presence WHERE pod = $1 AND epoch = $2::uuid AND id <> ALL($3)")
             .bind(&self.pod)
@@ -189,6 +190,26 @@ impl Presence {
                 log::warn!("presence re-assert failed: {e}");
                 self.dirty.store(true, Ordering::SeqCst);
             }
+        }
+    }
+
+    /// Like `register`, but never overwrites a newer connection or a live pod's row.
+    pub(crate) async fn claim(&self, devices: &[(String, u64)]) {
+        if devices.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = devices.iter().map(|(id, _)| id.clone()).collect();
+        let gens: Vec<i64> = devices.iter().map(|(_, gen)| gen_i64(*gen)).collect();
+        let res = sqlx::query(CLAIM)
+            .bind(&ids)
+            .bind(&self.pod)
+            .bind(&self.epoch)
+            .bind(&gens)
+            .execute(&self.pool)
+            .await;
+        if let Err(e) = res {
+            log::warn!("presence claim failed: {e}");
+            self.dirty.store(true, Ordering::SeqCst);
         }
     }
 

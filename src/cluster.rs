@@ -19,6 +19,9 @@ use std::{
     time::Duration,
 };
 
+/// Longer than a healthy heartbeat tick; a hung database must not hold up shutdown.
+const HEARTBEAT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ClusterConfig {
     pub(crate) pod: String,
@@ -145,13 +148,19 @@ impl Cluster {
         }
     }
 
-    /// The heartbeat finishes first, or it would write the pod row of a draining pod back.
+    /// The heartbeat finishes first, or it would write the pod row of a draining pod back;
+    /// a hung one is cut off so shutdown still deletes the rows.
     pub(crate) async fn stop(&self) {
         self.start_draining();
         let task = self.heartbeat.lock().ok().and_then(|mut h| h.take());
-        if let Some(task) = task {
-            if let Err(e) = task.await {
-                log::warn!("presence heartbeat ended badly: {e}");
+        if let Some(mut task) = task {
+            match tokio::time::timeout(HEARTBEAT_STOP_TIMEOUT, &mut task).await {
+                Ok(Err(e)) => log::warn!("presence heartbeat ended badly: {e}"),
+                Ok(Ok(())) => {}
+                Err(_) => {
+                    log::warn!("presence heartbeat still busy after {HEARTBEAT_STOP_TIMEOUT:?}, stopping it");
+                    task.abort();
+                }
             }
         }
         self.presence.stop().await;
@@ -173,13 +182,16 @@ impl Cluster {
                 self.presence.unregister(id, *gen).await;
             }
         }
-        let came: Vec<(&String, &u64)> = after.iter().filter(|(id, gen)| before.get(*id) != Some(*gen)).collect();
-        for (id, gen) in &came {
-            self.presence.register(id, **gen).await;
-        }
+        let came: Vec<(String, u64)> = after
+            .iter()
+            .filter(|(id, gen)| before.get(*id) != Some(*gen))
+            .map(|(id, gen)| (id.clone(), *gen))
+            .collect();
+        // `after` may be stale by now: a newer connection here or on a live pod must win.
+        self.presence.claim(&came).await;
         // One that left before its row was written again has already deleted it.
         let now = devices().await;
-        for (id, gen) in came {
+        for (id, gen) in &came {
             if now.get(id) != Some(gen) {
                 self.presence.unregister(id, *gen).await;
             }
@@ -411,6 +423,77 @@ mod tests {
         })
         .await;
         assert!(c1.presence.holder("brief").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reassert_replay_does_not_undo_a_newer_connection_here() {
+        let pool = pool().await;
+        let (c0, c1) = (cluster(&pool, "hbbs-0", 1).await, cluster(&pool, "hbbs-1", 1).await);
+        let (held, calls) = (&held(&[]), &AtomicUsize::new(0));
+        let c = &c0;
+        c0.reassert(move || async move {
+            let devices = snapshot(held);
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    held.lock().unwrap().insert("x".to_owned(), 2);
+                    c.presence.register("x", 2).await;
+                }
+                1 => {
+                    // Reconnects here before the replay of the older connection.
+                    held.lock().unwrap().insert("x".to_owned(), 3);
+                    c.presence.register("x", 3).await;
+                }
+                _ => {}
+            }
+            devices
+        })
+        .await;
+        assert_eq!(c1.presence.holder("x").await.map(|r| r.pod).as_deref(), Some("hbbs-0"));
+    }
+
+    #[tokio::test]
+    async fn reassert_replay_does_not_take_a_device_from_a_live_pod() {
+        let pool = pool().await;
+        let (c0, c1) = (cluster(&pool, "hbbs-0", 1).await, cluster(&pool, "hbbs-1", 1).await);
+        let (held, calls) = (&held(&[]), &AtomicUsize::new(0));
+        let (c, other) = (&c0, &c1);
+        c0.reassert(move || async move {
+            let devices = snapshot(held);
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    held.lock().unwrap().insert("x".to_owned(), 2);
+                    c.presence.register("x", 2).await;
+                }
+                1 => {
+                    // Moves to another pod before the replay.
+                    held.lock().unwrap().remove("x");
+                    c.presence.unregister("x", 2).await;
+                    other.presence.register("x", 5).await;
+                }
+                _ => {}
+            }
+            devices
+        })
+        .await;
+        assert_eq!(c0.presence.holder("x").await.map(|r| r.pod).as_deref(), Some("hbbs-1"));
+    }
+
+    #[tokio::test]
+    async fn stop_does_not_wait_forever_for_a_hung_heartbeat() {
+        let pool = pool().await;
+        let c0 = cluster(&pool, "hbbs-0", 1).await;
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        c0.run_heartbeat(move || {
+            let started_tx = started_tx.clone();
+            async move {
+                started_tx.send(()).ok();
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        started.recv().await;
+        let bound = HEARTBEAT_STOP_TIMEOUT + Duration::from_secs(2);
+        assert!(tokio::time::timeout(bound, c0.stop()).await.is_ok(), "stop hung on the heartbeat");
+        assert_eq!(pod_rows(&pool, "hbbs-0").await, 0);
     }
 
     async fn pod_rows(pool: &PgPool, pod: &str) -> i64 {
