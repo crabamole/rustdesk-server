@@ -2446,12 +2446,12 @@ mod tests {
             let mut client = viewer_reply(&rs, viewer).await;
             let phs = PunchHoleSent {
                 socket_addr: AddrMangle::encode(viewer).into(),
-                relay_server: "relay.example.com".to_owned(),
+                relay_server: "wss://relay.example.com/ws/relay/0".to_owned(),
                 ..Default::default()
             };
             rs.handle_hole_sent(phs, device, None).await.unwrap();
             let ph = next_reply(&mut client).await.punch_hole_response().clone();
-            assert_eq!(ph.relay_server, "relay.example.com");
+            assert_eq!(ph.relay_server, "wss://relay.example.com/ws/relay/0");
             assert_eq!(AddrMangle::decode(&ph.socket_addr), device);
         }
     }
@@ -2463,7 +2463,7 @@ mod tests {
 
     /// The relay list every test server hands out and accepts.
     fn test_relays() -> crate::relays::RelayList {
-        crate::relays::RelayList { urls: vec!["relay.example.com".to_owned()], checks: vec![] }
+        crate::relays::RelayList { urls: vec!["wss://relay.example.com/ws/relay/0".to_owned()], checks: vec![] }
     }
 
     async fn test_server() -> (RendezvousServer, Receiver) {
@@ -2477,7 +2477,7 @@ mod tests {
             ws_peers: Default::default(),
             pm,
             tx,
-            relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
+            relay_servers: Arc::new(vec!["wss://relay.example.com/ws/relay/0".to_owned()]),
             relay_list: Arc::new(test_relays()),
             rendezvous_servers: Arc::new(vec![]),
             inner: Arc::new(Inner {
@@ -2837,7 +2837,7 @@ mod tests {
         async fn test_relay_servers_list() {
             let (rs, _rx) = test_server().await;
             let result = rs.check_cmd("rs").await;
-            assert!(result.contains("relay.example.com"));
+            assert!(result.contains("wss://relay.example.com/ws/relay/0"));
         }
 
         #[tokio::test]
@@ -2954,7 +2954,7 @@ mod tests {
             ws_peers: Default::default(),
             pm,
             tx,
-            relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
+            relay_servers: Arc::new(vec!["wss://relay.example.com/ws/relay/0".to_owned()]),
             relay_list: Arc::new(test_relays()),
             rendezvous_servers: Arc::new(vec![]),
             inner: Arc::new(Inner {
@@ -3395,7 +3395,7 @@ mod tests {
                 ws_peers: Default::default(),
                 pm,
                 tx,
-                relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
+                relay_servers: Arc::new(vec!["wss://relay.example.com/ws/relay/0".to_owned()]),
                 relay_list: Arc::new(test_relays()),
                 rendezvous_servers: Arc::new(vec![]),
                 inner: Arc::new(Inner {
@@ -3439,7 +3439,7 @@ mod tests {
                 ws_peers: Default::default(),
                 pm,
                 tx,
-                relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
+                relay_servers: Arc::new(vec!["wss://relay.example.com/ws/relay/0".to_owned()]),
                 relay_list: Arc::new(test_relays()),
                 rendezvous_servers: Arc::new(vec![]),
                 inner: Arc::new(Inner {
@@ -3588,7 +3588,7 @@ mod tests {
                 socket_addr: AddrMangle::encode(addr_a).into(),
                 local_addr: vec![1, 2, 3, 4, 5, 6].into(),
                 id: "la_peer".to_owned(),
-                relay_server: "relay.example.com".to_owned(),
+                relay_server: "wss://relay.example.com/ws/relay/0".to_owned(),
                 ..Default::default()
             };
 
@@ -3871,7 +3871,7 @@ mod tests {
             let mut msg = RendezvousMessage::new();
             msg.set_relay_response(RelayResponse {
                 socket_addr: AddrMangle::encode(addr_b).into(),
-                relay_server: "relay.example.com".to_owned(),
+                relay_server: "wss://relay.example.com/ws/relay/0".to_owned(),
                 ..Default::default()
             });
             let bytes = msg.write_to_bytes().unwrap();
@@ -4000,7 +4000,7 @@ mod tests {
                 id: id.to_owned(),
                 token: token.to_owned(),
                 uuid: "relay-uuid".to_owned(),
-                relay_server: "relay.example.com".to_owned(),
+                relay_server: "wss://relay.example.com/ws/relay/0".to_owned(),
                 ..Default::default()
             });
             msg.write_to_bytes().unwrap()
@@ -4533,7 +4533,7 @@ mod tests {
             msg.set_request_relay(RequestRelay {
                 id: "fwd_dev5".to_owned(),
                 uuid: "fwd-uuid".to_owned(),
-                relay_server: "relay.example.com".to_owned(),
+                relay_server: "wss://relay.example.com/ws/relay/0".to_owned(),
                 ..Default::default()
             });
             let mut sink = None;

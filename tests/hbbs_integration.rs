@@ -843,9 +843,13 @@ async fn test_ws_register_peer_then_punch_hole_found() {
 
 #[tokio::test]
 async fn test_ws_request_relay_with_registered_peer() {
-    let server = hbbs::RendezvousServer::start_test("")
-        .await
-        .expect("start test server");
+    let relay = "wss://h/ws/relay/0";
+    let server = hbbs::RendezvousServer::start_test_with(hbbs::TestOptions {
+        relay_urls: vec![relay.to_owned()],
+        ..Default::default()
+    })
+    .await
+    .expect("start test server");
 
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let udp_addr = format!("127.0.0.1:{}", server.udp_port);
@@ -863,16 +867,27 @@ async fn test_ws_request_relay_with_registered_peer() {
     msg.set_request_relay(hbb_common::rendezvous_proto::RequestRelay {
         id: "relay_target_peer".to_owned(),
         uuid: "relay-test-uuid".to_owned(),
+        relay_server: relay.to_owned(),
         ..Default::default()
     });
     ws_send(&mut write, &msg).await;
 
-    // Give server time to process and forward
-    hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Drain B's socket — may or may not receive RequestRelay depending on timing
+    // The device gets the request over UDP, naming the same relay.
     let mut buf = vec![0u8; 65535];
-    let _ = timeout(Duration::from_secs(1), socket.recv_from(&mut buf)).await;
+    let forwarded = timeout(Duration::from_secs(3), async {
+        loop {
+            let (n, _) = socket.recv_from(&mut buf).await.unwrap();
+            if let Ok(m) = RendezvousMessage::parse_from_bytes(&buf[..n]) {
+                if m.has_request_relay() {
+                    return m.request_relay().clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("RequestRelay forwarded to the device");
+    assert_eq!(forwarded.uuid, "relay-test-uuid");
+    assert_eq!(forwarded.relay_server, relay);
 
     server.shutdown();
 }
