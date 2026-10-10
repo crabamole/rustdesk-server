@@ -40,8 +40,6 @@ async fn test_relay_checks_ignore_proxy_env() {
     .await
     .expect("start test server");
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    for _ in 0..20 {
-        assert_eq!(admin(server.nat_port, "tg 1.1.1.1 2.2.2.2").await, "\"wss://h/ws/relay/0\"");
-    }
+    assert_eq!(admin(server.nat_port, "rs").await, "wss://h/ws/relay/0\n");
     server.shutdown();
 }

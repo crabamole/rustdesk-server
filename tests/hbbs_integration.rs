@@ -659,30 +659,6 @@ async fn test_admin_cmd_relay_servers() {
 }
 
 #[tokio::test]
-async fn test_admin_cmd_test_geo() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
-    let server = hbbs::RendezvousServer::start_test("")
-        .await
-        .expect("start test server");
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", server.port))
-        .await
-        .unwrap();
-    stream
-        .write_all(b"tg 1.2.3.4 5.6.7.8")
-        .await
-        .unwrap();
-
-    let mut buf = vec![0u8; 4096];
-    let _result = timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
-    // Just verifying it doesn't crash; response depends on relay server config
-
-    server.shutdown();
-}
-
-#[tokio::test]
 async fn test_admin_cmd_on_nat_port() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -1064,9 +1040,7 @@ async fn test_relay_checks_steer_the_relay_handed_out() {
     .await
     .expect("start test server");
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    for _ in 0..20 {
-        assert_eq!(admin(server.nat_port, "tg 1.1.1.1 2.2.2.2").await, "\"wss://h/ws/relay/0\"");
-    }
+    assert_eq!(admin(server.nat_port, "rs").await, "wss://h/ws/relay/0\n");
     server.shutdown();
 }
 

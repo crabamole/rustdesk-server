@@ -128,7 +128,6 @@ struct Inner {
     version: String,
     software_url: String,
     mask: Option<Ipv4Network>,
-    local_ip: String,
     sk: Option<sign::SecretKey>,
     secure_tcp_pk_b: PublicKey,
     secure_tcp_sk_b: SecretKey,
@@ -187,16 +186,6 @@ impl RendezvousServer {
             log::info!("software_url: {}, version: {}", software_url, version);
         }
         let mask = get_arg("mask").parse().ok();
-        let local_ip = if mask.is_none() {
-            "".to_owned()
-        } else {
-            get_arg_or(
-                "local-ip",
-                local_ip_address::local_ip()
-                    .map(|x| x.to_string())
-                    .unwrap_or_default(),
-            )
-        };
         // For privacy use per connection key pair
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
         let mut rs = Self {
@@ -213,14 +202,12 @@ impl RendezvousServer {
                 software_url,
                 sk,
                 mask,
-                local_ip,
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
             cluster,
         };
         log::info!("mask: {:?}", rs.inner.mask);
-        log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.set_relay_list(crate::relays::RelayList::from_env()?);
         rs.spawn_cluster_tasks(internal_listener, probe);
@@ -962,7 +949,7 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
-            let relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
+            let relay_server = self.get_relay_server();
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
@@ -1194,7 +1181,7 @@ impl RendezvousServer {
         self.relay_list = Arc::new(list);
     }
 
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+    fn get_relay_server(&self) -> String {
         crate::relays::pick(&self.relay_servers)
     }
 
@@ -1206,14 +1193,12 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs)",
-                    "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
                     "punch-requests(pr) [<number>] [-]",
-                    "always-use-relay(aur)",
-                    "test-geo(tg) <ip1> <ip2>"
+                    "always-use-relay(aur)"
                 )
             }
             Some("relay-servers" | "rs") => {
@@ -1342,19 +1327,6 @@ impl RendezvousServer {
                         "ALWAYS_USE_RELAY: {:?}",
                         ALWAYS_USE_RELAY.load(Ordering::SeqCst)
                     );
-                }
-            }
-            Some("test-geo" | "tg") => {
-                if let Some(rs) = fds.next() {
-                    if let Ok(a) = rs.parse::<IpAddr>() {
-                        if let Some(rs) = fds.next() {
-                            if let Ok(b) = rs.parse::<IpAddr>() {
-                                res = format!("{:?}", self.get_relay_server(a, b));
-                            }
-                        } else {
-                            res = format!("{:?}", self.get_relay_server(a, a));
-                        }
-                    }
                 }
             }
             _ => {}
@@ -1918,7 +1890,6 @@ impl RendezvousServer {
                 software_url: String::new(),
                 sk,
                 mask: None,
-                local_ip: String::new(),
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
@@ -2294,24 +2265,18 @@ mod tests {
     mod relay_server_tests {
         use super::*;
 
-        fn ips() -> (IpAddr, IpAddr) {
-            (IpAddr::from([1, 1, 1, 1]), IpAddr::from([2, 2, 2, 2]))
-        }
-
         #[tokio::test]
         async fn test_get_relay_server_empty_returns_empty() {
             let (mut rs, _rx) = test_server().await;
             rs.set_relay_list(Default::default());
-            let (a, b) = ips();
-            assert_eq!(rs.get_relay_server(a, b), "");
+            assert_eq!(rs.get_relay_server(), "");
         }
 
         #[tokio::test]
         async fn test_get_relay_server_picks_among_handed_out_relays() {
             let (mut rs, _rx) = test_server().await;
             rs.set_relay_list(crate::relays::RelayList::parse("wss://h/ws/relay/0,wss://h/ws/relay/1", "").unwrap());
-            let (a, b) = ips();
-            let seen: std::collections::HashSet<String> = (0..200).map(|_| rs.get_relay_server(a, b)).collect();
+            let seen: std::collections::HashSet<String> = (0..200).map(|_| rs.get_relay_server()).collect();
             assert_eq!(seen.len(), 2);
         }
 
@@ -2319,7 +2284,6 @@ mod tests {
         fn lan_server(rs: &mut RendezvousServer) {
             rs.inner = Arc::new(Inner {
                 mask: Some("10.0.0.0/24".parse().unwrap()),
-                local_ip: "10.0.0.100".to_owned(),
                 ..(*rs.inner).clone()
             });
         }
@@ -2383,7 +2347,6 @@ mod tests {
                 version: String::new(),
                 software_url: String::new(),
                 mask: None,
-                local_ip: String::new(),
                 sk: None,
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
@@ -2839,20 +2802,6 @@ mod tests {
             let result = rs.check_cmd("aur N").await;
             assert!(result.is_empty());
         }
-
-        #[tokio::test]
-        async fn test_test_geo_command() {
-            let (rs, _rx) = test_server().await;
-            let result = rs.check_cmd("tg 10.0.0.1 10.0.0.2").await;
-            assert!(!result.is_empty());
-        }
-
-        #[tokio::test]
-        async fn test_test_geo_single_ip() {
-            let (rs, _rx) = test_server().await;
-            let result = rs.check_cmd("tg 10.0.0.1").await;
-            assert!(!result.is_empty());
-        }
     }
 
     async fn test_server_with_sk() -> (RendezvousServer, Receiver) {
@@ -2875,7 +2824,6 @@ mod tests {
                 version: String::new(),
                 software_url: String::new(),
                 mask: None,
-                local_ip: String::new(),
                 sk: Some(sk),
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
@@ -3192,14 +3140,6 @@ mod tests {
             rs.check_cmd(&format!("ic {} -", unique_id)).await;
             assert!(IP_CHANGES.lock().await.get(unique_id).is_none());
         }
-
-        #[tokio::test]
-        async fn test_reload_geo_command() {
-            let (rs, _rx) = test_server().await;
-            let result = rs.check_cmd("rg").await;
-            // reload-geo just reloads, returns empty or no output
-            assert!(result.is_empty());
-        }
     }
 
     mod more_check_ip_blocker_tests {
@@ -3325,8 +3265,7 @@ mod tests {
                     version: String::new(),
                     software_url: String::new(),
                     mask: Some(mask),
-                    local_ip: "10.0.0.100".to_owned(),
-                    sk: Some(sk),
+                        sk: Some(sk),
                     secure_tcp_pk_b,
                     secure_tcp_sk_b,
                 }),
@@ -3370,8 +3309,7 @@ mod tests {
                     version: String::new(),
                     software_url: String::new(),
                     mask: Some(mask),
-                    local_ip: "10.0.0.100".to_owned(),
-                    sk: Some(sk),
+                        sk: Some(sk),
                     secure_tcp_pk_b,
                     secure_tcp_sk_b,
                 }),
