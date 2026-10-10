@@ -99,6 +99,15 @@ type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
+const UNKNOWN_RELAY: &str = "Unknown relay server";
+
+/// Tells the viewer the peer named a relay hbbs did not hand out.
+fn unknown_relay_response() -> PunchHoleResponse {
+    PunchHoleResponse {
+        other_failure: UNKNOWN_RELAY.into(),
+        ..Default::default()
+    }
+}
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 static WS_PEER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -496,6 +505,15 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    if !self.is_own_relay(&rf.relay_server) {
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            refuse_reason: UNKNOWN_RELAY.into(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return (true, None);
+                    }
                     match admit_viewer(&rf.token, &rf.id).await {
                         Ok(r) => rf.controlled_context = controlled_context(&r),
                         Err(reason) => {
@@ -535,6 +553,10 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
+                    // The viewer then fails for lack of a relay rather than dialing another one.
+                    if !rr.relay_server.is_empty() && !self.is_own_relay(&rr.relay_server) {
+                        rr.relay_server.clear();
+                    }
                     let id = rr.id();
                     if !id.is_empty() {
                         let pk = self.get_pk(&rr.version, id.to_owned()).await;
@@ -828,16 +850,20 @@ impl RendezvousServer {
             &addr
         );
         let mut msg_out = RendezvousMessage::new();
-        let mut p = PunchHoleResponse {
-            socket_addr: AddrMangle::encode(addr).into(),
-            pk: self.get_pk(&phs.version, phs.id).await,
-            relay_server: phs.relay_server.clone(),
-            ..Default::default()
-        };
-        if let Ok(t) = phs.nat_type.enum_value() {
-            p.set_nat_type(t);
+        if self.is_own_relay(&phs.relay_server) {
+            let mut p = PunchHoleResponse {
+                socket_addr: AddrMangle::encode(addr).into(),
+                pk: self.get_pk(&phs.version, phs.id).await,
+                relay_server: phs.relay_server.clone(),
+                ..Default::default()
+            };
+            if let Ok(t) = phs.nat_type.enum_value() {
+                p.set_nat_type(t);
+            }
+            msg_out.set_punch_hole_response(p);
+        } else {
+            msg_out.set_punch_hole_response(unknown_relay_response());
         }
-        msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
             socket.send(&msg_out, addr_a).await?;
         } else {
@@ -862,14 +888,18 @@ impl RendezvousServer {
             &addr
         );
         let mut msg_out = RendezvousMessage::new();
-        let mut p = PunchHoleResponse {
-            socket_addr: la.local_addr.clone(),
-            pk: self.get_pk(&la.version, la.id).await,
-            relay_server: la.relay_server,
-            ..Default::default()
-        };
-        p.set_is_local(true);
-        msg_out.set_punch_hole_response(p);
+        if self.is_own_relay(&la.relay_server) {
+            let mut p = PunchHoleResponse {
+                socket_addr: la.local_addr.clone(),
+                pk: self.get_pk(&la.version, la.id).await,
+                relay_server: la.relay_server,
+                ..Default::default()
+            };
+            p.set_is_local(true);
+            msg_out.set_punch_hole_response(p);
+        } else {
+            msg_out.set_punch_hole_response(unknown_relay_response());
+        }
         if let Some(socket) = socket {
             socket.send(&msg_out, addr_a).await?;
         } else {
@@ -1183,6 +1213,11 @@ impl RendezvousServer {
 
     fn get_relay_server(&self) -> String {
         crate::relays::pick(&self.relay_servers)
+    }
+
+    /// hbbs forwards only relays from its own list, which is the same on every pod.
+    fn is_own_relay(&self, relay: &str) -> bool {
+        self.relay_list.urls.iter().any(|u| u == relay)
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
@@ -2305,6 +2340,7 @@ mod tests {
         async fn relay_response_keeps_the_relay_for_a_lan_viewer() {
             let (mut rs, _rx) = test_server().await;
             lan_server(&mut rs);
+            rs.set_relay_list(crate::relays::RelayList::parse("wss://h/ws/relay/0", "").unwrap());
             let viewer: SocketAddr = "10.0.0.10:1234".parse().unwrap();
             let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
             rs.tcp_punch.lock().await.insert(try_into_v4(viewer), sink);
@@ -2321,11 +2357,112 @@ mod tests {
             let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
             assert_eq!(reply.relay_response().relay_server, "wss://h/ws/relay/0");
         }
+
+        /// The answer a viewer gets on its punch-hole socket.
+        async fn viewer_reply(rs: &RendezvousServer, viewer: SocketAddr) -> Framed<TcpStream, BytesCodec> {
+            let (sink, client) = logged_in_only_tests::tcp_sink().await;
+            rs.tcp_punch.lock().await.insert(try_into_v4(viewer), sink);
+            client
+        }
+
+        async fn next_reply(client: &mut Framed<TcpStream, BytesCodec>) -> RendezvousMessage {
+            let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
+            RendezvousMessage::parse_from_bytes(&frame).unwrap()
+        }
+
+        #[tokio::test]
+        async fn request_relay_naming_another_relay_is_refused() {
+            let (mut rs, mut rx) = test_server().await;
+            register_peer(&mut rs, "other_relay_tgt", "10.0.0.5:9000").await;
+            let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
+            let mut msg = RendezvousMessage::new();
+            msg.set_request_relay(RequestRelay {
+                id: "other_relay_tgt".to_owned(),
+                uuid: "u".to_owned(),
+                relay_server: "ws://10.0.0.9:5432".to_owned(),
+                ..Default::default()
+            });
+            let viewer: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            assert!(rs.handle_tcp(&msg.write_to_bytes().unwrap(), &mut Some(sink), viewer, "", false).await.0);
+            assert_eq!(next_reply(&mut client).await.relay_response().refuse_reason, UNKNOWN_RELAY);
+            assert!(rx.try_recv().is_err(), "nothing must reach the target");
+        }
+
+        #[tokio::test]
+        async fn relay_response_drops_a_relay_hbbs_did_not_hand_out() {
+            let (mut rs, _rx) = test_server().await;
+            let viewer: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let mut client = viewer_reply(&rs, viewer).await;
+            let mut msg = RendezvousMessage::new();
+            msg.set_relay_response(RelayResponse {
+                socket_addr: AddrMangle::encode(viewer).into(),
+                relay_server: "ws://10.0.0.9:5432".to_owned(),
+                uuid: "u".to_owned(),
+                ..Default::default()
+            });
+            let device: SocketAddr = "10.0.0.5:7000".parse().unwrap();
+            assert!(rs.handle_tcp(&msg.write_to_bytes().unwrap(), &mut None, device, "", false).await.0);
+            let reply = next_reply(&mut client).await;
+            assert_eq!(reply.relay_response().uuid, "u");
+            assert_eq!(reply.relay_response().relay_server, "");
+        }
+
+        #[tokio::test]
+        async fn hole_sent_and_local_addr_with_another_relay_fail_for_the_viewer() {
+            let (mut rs, _rx) = test_server().await;
+            let viewer: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let device: SocketAddr = "10.0.0.5:7000".parse().unwrap();
+
+            let mut client = viewer_reply(&rs, viewer).await;
+            let phs = PunchHoleSent {
+                socket_addr: AddrMangle::encode(viewer).into(),
+                relay_server: "ws://10.0.0.9:5432".to_owned(),
+                ..Default::default()
+            };
+            rs.handle_hole_sent(phs, device, None).await.unwrap();
+            let ph = next_reply(&mut client).await.punch_hole_response().clone();
+            assert_eq!(ph.other_failure, UNKNOWN_RELAY);
+            assert!(ph.socket_addr.is_empty() && ph.relay_server.is_empty());
+
+            let mut client = viewer_reply(&rs, viewer).await;
+            let la = LocalAddr {
+                socket_addr: AddrMangle::encode(viewer).into(),
+                local_addr: AddrMangle::encode(device).into(),
+                relay_server: "ws://10.0.0.9:5432".to_owned(),
+                ..Default::default()
+            };
+            rs.handle_local_addr(la, device, None).await.unwrap();
+            let ph = next_reply(&mut client).await.punch_hole_response().clone();
+            assert_eq!(ph.other_failure, UNKNOWN_RELAY);
+            assert!(ph.socket_addr.is_empty() && ph.relay_server.is_empty());
+        }
+
+        #[tokio::test]
+        async fn hole_sent_with_an_own_relay_reaches_the_viewer() {
+            let (mut rs, _rx) = test_server().await;
+            let viewer: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let device: SocketAddr = "10.0.0.5:7000".parse().unwrap();
+            let mut client = viewer_reply(&rs, viewer).await;
+            let phs = PunchHoleSent {
+                socket_addr: AddrMangle::encode(viewer).into(),
+                relay_server: "relay.example.com".to_owned(),
+                ..Default::default()
+            };
+            rs.handle_hole_sent(phs, device, None).await.unwrap();
+            let ph = next_reply(&mut client).await.punch_hole_response().clone();
+            assert_eq!(ph.relay_server, "relay.example.com");
+            assert_eq!(AddrMangle::decode(&ph.socket_addr), device);
+        }
     }
 
     fn test_cluster(db: &crate::database::Database) -> Arc<crate::cluster::Cluster> {
         let presence = crate::presence::Presence::new(db.pool().clone(), "hbbs-0".to_owned(), "127.0.0.1:1".to_owned());
         Arc::new(crate::cluster::Cluster::new(presence, 0, 20, [7; 32]))
+    }
+
+    /// The relay list every test server hands out and accepts.
+    fn test_relays() -> crate::relays::RelayList {
+        crate::relays::RelayList { urls: vec!["relay.example.com".to_owned()], checks: vec![] }
     }
 
     async fn test_server() -> (RendezvousServer, Receiver) {
@@ -2340,7 +2477,7 @@ mod tests {
             pm,
             tx,
             relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
-            relay_list: Default::default(),
+            relay_list: Arc::new(test_relays()),
             rendezvous_servers: Arc::new(vec![]),
             inner: Arc::new(Inner {
                 serial: 1,
@@ -2817,7 +2954,7 @@ mod tests {
             pm,
             tx,
             relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
-            relay_list: Default::default(),
+            relay_list: Arc::new(test_relays()),
             rendezvous_servers: Arc::new(vec![]),
             inner: Arc::new(Inner {
                 serial: 1,
@@ -3258,14 +3395,14 @@ mod tests {
                 pm,
                 tx,
                 relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
-                relay_list: Default::default(),
+                relay_list: Arc::new(test_relays()),
                 rendezvous_servers: Arc::new(vec![]),
                 inner: Arc::new(Inner {
                     serial: 1,
                     version: String::new(),
                     software_url: String::new(),
                     mask: Some(mask),
-                        sk: Some(sk),
+                    sk: Some(sk),
                     secure_tcp_pk_b,
                     secure_tcp_sk_b,
                 }),
@@ -3302,14 +3439,14 @@ mod tests {
                 pm,
                 tx,
                 relay_servers: Arc::new(vec!["relay.example.com".to_owned()]),
-                relay_list: Default::default(),
+                relay_list: Arc::new(test_relays()),
                 rendezvous_servers: Arc::new(vec![]),
                 inner: Arc::new(Inner {
                     serial: 1,
                     version: String::new(),
                     software_url: String::new(),
                     mask: Some(mask),
-                        sk: Some(sk),
+                    sk: Some(sk),
                     secure_tcp_pk_b,
                     secure_tcp_sk_b,
                 }),
@@ -3862,6 +3999,7 @@ mod tests {
                 id: id.to_owned(),
                 token: token.to_owned(),
                 uuid: "relay-uuid".to_owned(),
+                relay_server: "relay.example.com".to_owned(),
                 ..Default::default()
             });
             msg.write_to_bytes().unwrap()
@@ -4391,7 +4529,12 @@ mod tests {
             pod1.register("fwd_dev5", 1).await;
             let viewer: SocketAddr = "192.168.1.1:1234".parse().unwrap();
             let mut msg = RendezvousMessage::new();
-            msg.set_request_relay(RequestRelay { id: "fwd_dev5".to_owned(), uuid: "fwd-uuid".to_owned(), ..Default::default() });
+            msg.set_request_relay(RequestRelay {
+                id: "fwd_dev5".to_owned(),
+                uuid: "fwd-uuid".to_owned(),
+                relay_server: "relay.example.com".to_owned(),
+                ..Default::default()
+            });
             let mut sink = None;
             rs.handle_tcp(&msg.write_to_bytes().unwrap(), &mut sink, viewer, "", true).await;
             match timeout(5000, calls.recv()).await.ok().flatten() {

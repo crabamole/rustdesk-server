@@ -739,15 +739,19 @@ async fn ws_recv(
 
 #[tokio::test]
 async fn test_ws_request_relay_peer_not_found() {
-    let server = hbbs::RendezvousServer::start_test("")
-        .await
-        .expect("start test server");
+    let server = hbbs::RendezvousServer::start_test_with(hbbs::TestOptions {
+        relay_urls: vec!["wss://h/ws/relay/0".to_owned()],
+        ..Default::default()
+    })
+    .await
+    .expect("start test server");
 
     let (mut write, mut read) = ws_connect_hbbs(server.ws_port).await;
 
     let mut msg = RendezvousMessage::new();
     msg.set_request_relay(hbb_common::rendezvous_proto::RequestRelay {
         id: "nonexistent_relay_peer".to_owned(),
+        relay_server: "wss://h/ws/relay/0".to_owned(),
         ..Default::default()
     });
     ws_send(&mut write, &msg).await;
