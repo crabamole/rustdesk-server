@@ -854,6 +854,15 @@ async fn test_ws_request_relay_with_registered_peer() {
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let udp_addr = format!("127.0.0.1:{}", server.udp_port);
 
+    // A device hbbs knows: key first, then its address.
+    let mut msg = RendezvousMessage::new();
+    msg.set_register_pk(RegisterPk {
+        id: "relay_target_peer".to_owned(),
+        uuid: vec![30; 16].into(),
+        pk: vec![31; 32].into(),
+        ..Default::default()
+    });
+    send_recv_udp(&socket, &msg, &udp_addr).await;
     let mut msg = RendezvousMessage::new();
     msg.set_register_peer(RegisterPeer {
         id: "relay_target_peer".to_owned(),
