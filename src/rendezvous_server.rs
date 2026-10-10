@@ -45,7 +45,6 @@ use std::{
 };
 
 use reqwest::Client;
-use serde_json::json;
 
 #[derive(Clone, Debug)]
 enum Data {
@@ -1687,10 +1686,7 @@ impl RendezvousServer {
 }
 
 impl RendezvousServer {
-    /// Readiness fails and presence goes before the connections close, so devices that
-    /// reconnect elsewhere at once are not routed back here.
-    /// Devices are closed before presence is cleared, so none is unlisted while still connected here;
-    /// the cleanup removes only this pod's (pod, epoch) rows, never a device's claim on another pod.
+    /// Closes devices before clearing this pod's (pod, epoch) presence rows, so none is unlisted while still connected here.
     async fn drain(&self) {
         self.cluster.start_draining();
         let devices: Vec<Sink> = self.ws_peers.lock().await.drain().map(|(_, (_, sink))| sink).collect();
@@ -2051,10 +2047,13 @@ const API_CHECK_TIMEOUT_MS: u64 = if cfg!(test) { 500 } else { 5_000 };
 static API_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 /// Opens a new connection per request: a stopping api-server pod closes every pooled one at once.
 static API_RETRY_CLIENT: Lazy<Client> =
-    Lazy::new(|| Client::builder().pool_max_idle_per_host(0).build().unwrap_or_else(|_| Client::new()));
+    Lazy::new(|| Client::builder().pool_max_idle_per_host(0).build().unwrap_or_else(|e| {
+        log::warn!("retry client keeps its connection pool: {e}");
+        Client::new()
+    }));
 
 enum ViewerCheck {
-    /// Token accepted; the ref is empty when the api-server predates /api/audit/ref.
+    /// Token accepted, with its audit ref.
     User(String),
     Rejected,
     Unavailable,
@@ -2090,20 +2089,6 @@ async fn check_viewer_token(token: &str, target: &str) -> ViewerCheck {
             }
         },
         401 | 403 => ViewerCheck::Rejected,
-        404 => match client
-            .post(format!("{api_server}/api/currentUser"))
-            .bearer_auth(token)
-            .json(&json!({ "id": "", "uuid": "uuid" }))
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => ViewerCheck::User(String::new()),
-            Ok(_) => ViewerCheck::Rejected,
-            Err(e) => {
-                log::warn!("api-server unreachable: {e}");
-                ViewerCheck::Unavailable
-            }
-        },
         status => {
             log::warn!("/api/audit/ref answered {status}");
             ViewerCheck::Unavailable
@@ -2199,6 +2184,7 @@ mod tests {
             let listener = create_tcp_listener(0).await.unwrap();
             let port = listener.local_addr().unwrap().port();
             // Nobody accepts, as when the accept loop lags a burst: each handshake must still complete.
+            // Passes only where net.core.somaxconn >= 600.
             let conns = (0..600).map(|_| timeout(500, tokio::net::TcpStream::connect(("127.0.0.1", port))));
             let done = hbb_common::futures::future::join_all(conns).await;
             let stuck = done.iter().filter(|r| !matches!(r, Ok(Ok(_)))).count();
@@ -2418,7 +2404,7 @@ mod tests {
             msg.set_request_relay(RequestRelay {
                 id: "other_relay_tgt".to_owned(),
                 uuid: "u".to_owned(),
-                relay_server: "ws://10.0.0.9:5432".to_owned(),
+                relay_server: "wss://other.example.com/ws/relay/9".to_owned(),
                 ..Default::default()
             });
             let viewer: SocketAddr = "192.168.1.1:1234".parse().unwrap();
@@ -2435,7 +2421,7 @@ mod tests {
             let mut msg = RendezvousMessage::new();
             msg.set_relay_response(RelayResponse {
                 socket_addr: AddrMangle::encode(viewer).into(),
-                relay_server: "ws://10.0.0.9:5432".to_owned(),
+                relay_server: "wss://other.example.com/ws/relay/9".to_owned(),
                 uuid: "u".to_owned(),
                 ..Default::default()
             });
@@ -2455,7 +2441,7 @@ mod tests {
             let mut client = viewer_reply(&rs, viewer).await;
             let phs = PunchHoleSent {
                 socket_addr: AddrMangle::encode(viewer).into(),
-                relay_server: "ws://10.0.0.9:5432".to_owned(),
+                relay_server: "wss://other.example.com/ws/relay/9".to_owned(),
                 ..Default::default()
             };
             rs.handle_hole_sent(phs, device, None).await.unwrap();
@@ -2467,7 +2453,7 @@ mod tests {
             let la = LocalAddr {
                 socket_addr: AddrMangle::encode(viewer).into(),
                 local_addr: AddrMangle::encode(device).into(),
-                relay_server: "ws://10.0.0.9:5432".to_owned(),
+                relay_server: "wss://other.example.com/ws/relay/9".to_owned(),
                 ..Default::default()
             };
             rs.handle_local_addr(la, device, None).await.unwrap();
@@ -3967,24 +3953,13 @@ mod tests {
 
         /// Answers every request with `status` and `body`; returns the base URL.
         async fn api_stub(status: u16, body: &'static str) -> String {
-            api_stub_routes((status, body), (status, body)).await
-        }
-
-        /// Answers `/api/audit/ref` with `audit_ref` and every other path with `other`.
-        async fn api_stub_routes(
-            audit_ref: (u16, &'static str),
-            other: (u16, &'static str),
-        ) -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
                 loop {
                     let (mut s, _) = listener.accept().await.unwrap();
                     let mut buf = [0u8; 4096];
-                    let n = s.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
-                    let first = req.lines().next().unwrap_or_default();
-                    let (status, body) = if first.contains("/api/audit/ref?target=") { audit_ref } else { other };
+                    let _ = s.read(&mut buf).await;
                     let resp = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                     let _ = s.write_all(resp.as_bytes()).await;
                 }
@@ -4238,29 +4213,14 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_older_api_server_falls_back_to_current_user() {
+        async fn test_audit_ref_not_found_counts_as_unavailable() {
             let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
-            register_peer(&mut rs, "old_api_peer", "10.0.0.5:5000").await;
+            register_peer(&mut rs, "no_ref_peer", "10.0.0.5:5000").await;
 
-            set_env(Some(&api_stub_routes((404, "{}"), (200, r#"{"name":"u"}"#)).await), true);
+            set_env(Some(&api_stub(404, "{}").await), true);
             let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
-            let (msg, to) = rs.handle_punch_hole_request(addr, punch("old_api_peer", "tok"), "", false).await.unwrap();
-
-            assert!(to.is_some());
-            assert!(msg.has_punch_hole());
-            assert!(msg.punch_hole().controlled_context.is_none());
-        }
-
-        #[tokio::test]
-        async fn test_older_api_server_rejects_token() {
-            let _guard = EnvGuard::acquire().await;
-            let (mut rs, _rx) = test_server_with_sk().await;
-            register_peer(&mut rs, "old_api_peer2", "10.0.0.5:5000").await;
-
-            set_env(Some(&api_stub_routes((404, "{}"), (401, "{}")).await), true);
-            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
-            let (msg, to) = rs.handle_punch_hole_request(addr, punch("old_api_peer2", "tok"), "", false).await.unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("no_ref_peer", "tok"), "", false).await.unwrap();
 
             assert!(to.is_none());
             assert!(msg.punch_hole_response().other_failure.contains("session expired"));

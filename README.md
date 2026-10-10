@@ -144,8 +144,8 @@ Several hbbs processes can share one database, e.g. as the pods of a Kubernetes 
   WebSocket clients behind the proxy are unaffected; their port was never usable for punching.
 - The per-IP registration limits (`IP_BLOCK_PER_MINUTE`, `IP_BLOCK_IDS_PER_DAY`) count per pod, so the
   effective limit is the number of pods times the setting.
-- On SIGTERM hbbs fails `/readyz`, deletes its presence rows and closes its device connections, so
-  devices reconnect to other pods at once, then exits. Give the pod a short `preStop` pause so the
+- On SIGTERM hbbs fails `/readyz`, closes its device connections, then deletes only its own presence
+  rows, so devices reconnect to other pods at once, then exits. Give the pod a short `preStop` pause so the
   Service drops it before the connections close.
 
 ## Building
