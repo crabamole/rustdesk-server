@@ -2019,8 +2019,28 @@ async fn create_udp_listener(port: i32, rmem: usize) -> ResultType<FramedSocket>
 #[inline]
 async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
+    widen_backlog(&s)?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+/// Capped by net.core.somaxconn.
+const LISTEN_BACKLOG: i32 = 4096;
+
+/// A draining pod sends all its devices here at once; hbb_common's backlog of 128 drops most of them.
+#[cfg(unix)]
+fn widen_backlog(listener: &TcpListener) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // listen() again on a listening socket only changes its backlog.
+    if unsafe { hbb_common::libc::listen(listener.as_raw_fd(), LISTEN_BACKLOG) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn widen_backlog(_listener: &TcpListener) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Bounds every api-server login check so a hung api-server cannot stall connection requests.
@@ -2165,6 +2185,21 @@ mod tests {
         fn drop(&mut self) {
             std::env::remove_var("API_SERVER");
             std::env::remove_var("LOGGED_IN_ONLY");
+        }
+    }
+
+    mod listener_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn tcp_listener_queues_a_reconnect_burst() {
+            let listener = create_tcp_listener(0).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            // Nobody accepts, as when the accept loop lags a burst: each handshake must still complete.
+            let conns = (0..600).map(|_| timeout(500, tokio::net::TcpStream::connect(("127.0.0.1", port))));
+            let done = hbb_common::futures::future::join_all(conns).await;
+            let stuck = done.iter().filter(|r| !matches!(r, Ok(Ok(_)))).count();
+            assert_eq!(stuck, 0, "connections not established within 500 ms");
         }
     }
 
