@@ -30,9 +30,14 @@ impl RelayList {
         Ok(Self { urls, checks })
     }
 
+    /// hbbs is the only source of relays, so it refuses to start without one.
     pub(crate) fn from_env() -> ResultType<Self> {
         let var = |name: &str| std::env::var(name).unwrap_or_default();
-        Self::parse(&var("RELAY_URLS"), &var("RELAY_CHECKS"))
+        let list = Self::parse(&var("RELAY_URLS"), &var("RELAY_CHECKS"))?;
+        if list.urls.is_empty() {
+            bail!("RELAY_URLS is empty: set the relay URLs hbbs hands out, e.g. wss://<host>/ws/relay/0");
+        }
+        Ok(list)
     }
 
     /// When every check fails, handing out all relays beats handing out none.
@@ -78,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn from_env_reads_both_lists() {
+    fn from_env_reads_both_lists_and_requires_urls() {
         std::env::set_var("RELAY_URLS", "wss://h/ws/relay/0");
         std::env::set_var("RELAY_CHECKS", "http://hbbr-0:21122/readyz");
         let l = RelayList::from_env().unwrap();
@@ -86,6 +91,9 @@ mod tests {
         std::env::remove_var("RELAY_CHECKS");
         assert_eq!(l.urls, vec!["wss://h/ws/relay/0"]);
         assert_eq!(l.checks, vec!["http://hbbr-0:21122/readyz"]);
+        // Same test: both mutate RELAY_URLS.
+        let err = RelayList::from_env().unwrap_err().to_string();
+        assert!(err.contains("RELAY_URLS is empty"), "{err}");
     }
 
     #[test]

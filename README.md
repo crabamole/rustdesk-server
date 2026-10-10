@@ -62,7 +62,7 @@ docker run -d --name hbbs \
   -v "$PWD/data:/usr/local/share/rustdesk-server" \
   -e DB_URL=postgres://rustdesk:secret@db.example.com:5432/rustdesk \
   -e API_SERVER=http://api.example.com:21114 \
-  -e RELAY_URLS=relay.example.com:21117 \
+  -e RELAY_URLS=ws://relay.example.com:21119 \
   ghcr.io/crabamole/rustdesk-server:1.1.16-2 hbbs
 ```
 
@@ -104,7 +104,7 @@ file in the working directory, or in an INI file passed with `-c`.
 | | `KEEP_ALIVE_SECS` | Keep-alive sent to devices at registration (default `20`); a device drops a connection silent for 1.5 × this |
 | `-p, --port` | `PORT` | Rendezvous port (default `21116`) |
 | `-k, --key` | `KEY` | Only allow clients with this key. The default `-` uses the keypair in the working directory, generated on first start. hbbs needs the secret key (pod-to-pod calls authenticate with a token derived from it), so a bare public key is refused |
-| | `RELAY_URLS` | Relay addresses handed to clients, comma-separated, e.g. `wss://host/ws/relay/0,wss://host/ws/relay/1`; one is picked at random per session |
+| | `RELAY_URLS` | **Required.** Relay addresses handed to clients, comma-separated, e.g. `wss://host/ws/relay/0,wss://host/ws/relay/1`; one is picked at random per session. Clients dial the address exactly as given and have no relay setting of their own; hbbs refuses to start without one |
 | | `RELAY_CHECKS` | Optional health URLs, same order and length as `RELAY_URLS`, polled every 3 s (e.g. `http://rustdesk-hbbr-0:21122/readyz`); only relays answering 200 are handed out, all of them when none does |
 | `-R, --rendezvous-servers` | | Rendezvous servers, comma-separated |
 | `--mask` | | LAN range, e.g. `192.168.0.0/16`, used to detect LAN connections |
