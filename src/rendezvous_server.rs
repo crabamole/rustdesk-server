@@ -1689,11 +1689,14 @@ impl RendezvousServer {
 impl RendezvousServer {
     /// Readiness fails and presence goes before the connections close, so devices that
     /// reconnect elsewhere at once are not routed back here.
+    /// Devices are closed before presence is cleared, so none is unlisted while still connected here;
+    /// the cleanup removes only this pod's (pod, epoch) rows, never a device's claim on another pod.
     async fn drain(&self) {
-        self.cluster.stop().await;
+        self.cluster.start_draining();
         let devices: Vec<Sink> = self.ws_peers.lock().await.drain().map(|(_, (_, sink))| sink).collect();
         log::info!("draining: closing {} device connections", devices.len());
         hbb_common::futures::future::join_all(devices.into_iter().map(close_sink)).await;
+        self.cluster.stop().await;
     }
 
     fn spawn_cluster_tasks(&self, internal: TcpListener, probe: Arc<StartupProbe>) {
@@ -4336,6 +4339,49 @@ mod tests {
             assert!(rs.ws_peers.lock().await.is_empty());
             assert!(timeout(5000, client.next()).await.unwrap().is_none(), "the device sees its connection end");
             assert_eq!(rows().await, 0);
+        }
+
+        #[tokio::test]
+        async fn drain_closes_devices_before_clearing_presence() {
+            let (rs, _rx) = test_server().await;
+            rs.cluster.presence.start().await.unwrap();
+            let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
+            rs.ws_peers.lock().await.insert("drain_first".to_owned(), (1, sink));
+            rs.cluster.presence.register("drain_first", 1).await;
+            // A held row lock stalls the presence delete; the device must be closed regardless.
+            let mut lock = rs.pm.db.pool().begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM peer_presence WHERE id = 'drain_first' FOR UPDATE")
+                .execute(&mut *lock)
+                .await
+                .unwrap();
+            let drain = tokio::spawn({
+                let rs = rs.clone();
+                async move { rs.drain().await }
+            });
+            assert!(
+                timeout(1000, client.next()).await.unwrap().is_none(),
+                "the device is closed before the presence cleanup"
+            );
+            assert!(rs.cluster.is_draining());
+            lock.rollback().await.unwrap();
+            drain.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn drain_keeps_a_device_that_moved_to_another_pod() {
+            let (rs, _rx) = test_server().await;
+            rs.cluster.presence.start().await.unwrap();
+            let (sink, _client) = logged_in_only_tests::tcp_sink().await;
+            rs.ws_peers.lock().await.insert("moved_dev".to_owned(), (1, sink));
+            rs.cluster.presence.register("moved_dev", 1).await;
+            other_pod(&rs).register("moved_dev", 7).await;
+
+            rs.drain().await;
+            let pod = sqlx::query_scalar::<_, String>("SELECT pod FROM peer_presence WHERE id = 'moved_dev'")
+                .fetch_optional(rs.pm.db.pool())
+                .await
+                .unwrap();
+            assert_eq!(pod.as_deref(), Some("hbbs-1"));
         }
 
         #[test]
