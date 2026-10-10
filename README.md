@@ -104,7 +104,7 @@ file in the working directory, or in an INI file passed with `-c`.
 | | `KEEP_ALIVE_SECS` | Keep-alive sent to devices at registration (default `20`); a device drops a connection silent for 1.5 × this |
 | `-p, --port` | `PORT` | Rendezvous port (default `21116`) |
 | `-k, --key` | `KEY` | Only allow clients with this key. The default `-` uses the keypair in the working directory, generated on first start. hbbs needs the secret key (pod-to-pod calls authenticate with a token derived from it), so a bare public key is refused |
-| | `RELAY_URLS` | **Required.** Relay addresses handed to clients, comma-separated, e.g. `wss://host/ws/relay/0,wss://host/ws/relay/1`; one is picked at random per session. Clients dial the address exactly as given and have no relay setting of their own; hbbs refuses to start without one |
+| | `RELAY_URLS` | **Required.** `ws://` or `wss://` relay URLs handed to clients, comma-separated, e.g. `wss://host/ws/relay/0,wss://host/ws/relay/1`; one is picked at random per session. Clients dial the URL exactly as given and have no relay setting of their own; hbbs forwards only relays from this list and refuses to start without a valid one |
 | | `RELAY_CHECKS` | Optional health URLs, same order and length as `RELAY_URLS`, polled every 3 s (e.g. `http://rustdesk-hbbr-0:21122/readyz`); only relays answering 200 are handed out, all of them when none does |
 | `-R, --rendezvous-servers` | | Rendezvous servers, comma-separated |
 | `--mask` | | LAN range, e.g. `192.168.0.0/16`, used to detect LAN connections |

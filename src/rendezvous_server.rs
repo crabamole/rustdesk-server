@@ -169,6 +169,7 @@ impl RendezvousServer {
         let nat_port = port - 1;
         let ws_port = port + 2;
         let cfg = crate::cluster::ClusterConfig::from_env()?;
+        let relays = crate::relays::RelayList::from_env()?;
         let probe = Arc::new(StartupProbe::default());
         let health = crate::health::bind(cfg.health_port)?;
         let serving = probe.clone();
@@ -218,7 +219,7 @@ impl RendezvousServer {
         };
         log::info!("mask: {:?}", rs.inner.mask);
         std::env::set_var("PORT_FOR_API", port.to_string());
-        rs.set_relay_list(crate::relays::RelayList::from_env()?);
+        rs.set_relay_list(relays);
         rs.spawn_cluster_tasks(internal_listener, probe);
         let mut listener = create_tcp_listener(port).await?;
         let mut listener2 = create_tcp_listener(nat_port).await?;

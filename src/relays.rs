@@ -27,6 +27,10 @@ impl RelayList {
         if !checks.is_empty() && checks.len() != urls.len() {
             bail!("RELAY_CHECKS has {} entries but RELAY_URLS has {}", checks.len(), urls.len());
         }
+        // Clients dial only ws(s) relays.
+        if let Some(bad) = urls.iter().find(|u| !u.starts_with("ws://") && !u.starts_with("wss://")) {
+            bail!("RELAY_URLS entry {bad} is not a ws:// or wss:// URL");
+        }
         Ok(Self { urls, checks })
     }
 
@@ -78,6 +82,9 @@ mod tests {
         assert_eq!(l.urls, vec!["wss://h/ws/relay/0", "wss://h/ws/relay/1"]);
         assert_eq!(l.checks, vec!["http://a/readyz", "http://b/readyz"]);
         assert!(RelayList::parse("wss://a,wss://b", "http://a/readyz").is_err());
+        let err = RelayList::parse("wss://a,relay.example.com:21117", "").unwrap_err().to_string();
+        assert!(err.contains("relay.example.com:21117 is not a ws:// or wss:// URL"), "{err}");
+        assert!(RelayList::parse("ws://a:21119", "").is_ok());
         assert_eq!(RelayList::parse("wss://a", "").unwrap().checks, Vec::<String>::new());
         assert_eq!(RelayList::parse("", "").unwrap(), RelayList::default());
     }
