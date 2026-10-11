@@ -303,3 +303,32 @@ async fn drain_moves_devices_and_fails_readiness() {
     assert_eq!(http_status(server.health_port, "/livez").await, 200);
     server.shutdown();
 }
+
+#[tokio::test]
+async fn leave_serves_new_connections_until_they_stop_then_moves_devices() {
+    let server = std::sync::Arc::new(start("hbbs-0", None).await);
+    let (_dw, mut dr, _) = device(server.ws_port, "clu_leave1").await;
+    let leaving = tokio::spawn({
+        let server = server.clone();
+        async move { server.leave(Duration::from_millis(1500), Duration::from_secs(10)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(http_status(server.health_port, "/readyz").await, 503, "proxies stop routing here");
+    // Proxies that have not noticed yet keep connecting: each is served, and the device stays.
+    let begun = std::time::Instant::now();
+    for i in 0.. {
+        if begun.elapsed() >= Duration::from_secs(3) {
+            break;
+        }
+        let (_w, _r, resp) = device(server.ws_port, &format!("clu_leave_new{i}")).await;
+        assert_eq!(resp.result.value(), 0, "registration {i} while leaving");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(timeout(Duration::from_millis(100), dr.next()).await.is_err(), "device still connected");
+    // Connections stopped: the devices are closed so they reconnect to another pod.
+    match timeout(Duration::from_secs(5), dr.next()).await {
+        Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {}
+        other => panic!("device connection still open: {other:?}"),
+    }
+    timeout(Duration::from_secs(5), leaving).await.unwrap().unwrap();
+}

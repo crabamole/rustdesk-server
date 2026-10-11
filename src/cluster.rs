@@ -90,6 +90,11 @@ pub(crate) struct Cluster {
     token: Token,
     draining: watch::Sender<bool>,
     heartbeat: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Set on SIGTERM: readiness fails while devices stay until new connections stop arriving.
+    leaving: std::sync::atomic::AtomicBool,
+    started: std::time::Instant,
+    /// Milliseconds since `started` of the last accepted client connection.
+    last_arrival_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Cluster {
@@ -101,6 +106,45 @@ impl Cluster {
             token,
             draining: watch::Sender::new(false),
             heartbeat: Default::default(),
+            leaving: Default::default(),
+            started: std::time::Instant::now(),
+            last_arrival_ms: Default::default(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// A client connection was accepted on a public port.
+    pub(crate) fn note_arrival(&self) {
+        self.last_arrival_ms.store(self.now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_leaving(&self) -> bool {
+        self.leaving.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fails readiness, then waits until no connection arrived for `quiet` (at least `quiet`,
+    /// at most `max`), or until `stop` resolves: by then the Service and the gateway route
+    /// elsewhere, so devices closed afterwards reconnect to another pod.
+    pub(crate) async fn leave_when_quiet(&self, quiet: Duration, max: Duration, stop: impl Future<Output = ()>) {
+        use std::sync::atomic::Ordering;
+        self.leaving.store(true, Ordering::Relaxed);
+        let begun = std::time::Instant::now();
+        let quiet_ms = u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX);
+        let wait = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let idle = self.now_ms().saturating_sub(self.last_arrival_ms.load(Ordering::Relaxed));
+                if (idle >= quiet_ms && begun.elapsed() >= quiet) || begun.elapsed() >= max {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            _ = wait => log::info!("no new connections for {quiet:?}: closing devices"),
+            _ = stop => log::info!("second signal: closing devices now"),
         }
     }
 
@@ -571,5 +615,42 @@ mod tests {
         assert!(c0.is_draining());
         assert_eq!(pod_rows(&pool, "hbbs-0").await, 0);
         assert!(ticks.recv().await.is_none(), "the heartbeat task ended");
+    }
+
+    #[tokio::test]
+    async fn leave_ends_after_a_quiet_period_and_fails_readiness_first() {
+        let pool = pool().await;
+        let c = cluster(&pool, "hbbs-0", 1).await;
+        let t = std::time::Instant::now();
+        c.leave_when_quiet(Duration::from_millis(300), Duration::from_secs(5), std::future::pending()).await;
+        assert!(c.is_leaving());
+        assert!(!c.is_draining(), "devices are still here: the presence heartbeat keeps running");
+        assert!(t.elapsed() >= Duration::from_millis(300) && t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[tokio::test]
+    async fn leave_waits_while_connections_arrive_up_to_the_cap() {
+        let pool = pool().await;
+        let c = std::sync::Arc::new(cluster(&pool, "hbbs-0", 1).await);
+        let busy = c.clone();
+        let feeder = tokio::spawn(async move {
+            loop {
+                busy.note_arrival();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let t = std::time::Instant::now();
+        c.leave_when_quiet(Duration::from_millis(300), Duration::from_millis(900), std::future::pending()).await;
+        feeder.abort();
+        assert!(t.elapsed() >= Duration::from_millis(900), "only the cap ends it: {:?}", t.elapsed());
+    }
+
+    #[tokio::test]
+    async fn leave_stops_early_on_a_second_signal() {
+        let pool = pool().await;
+        let c = cluster(&pool, "hbbs-0", 1).await;
+        let t = std::time::Instant::now();
+        c.leave_when_quiet(Duration::from_secs(5), Duration::from_secs(10), tokio::time::sleep(Duration::from_millis(100))).await;
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }
 }

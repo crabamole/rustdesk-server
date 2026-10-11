@@ -295,10 +295,19 @@ impl RendezvousServer {
                 }
             }
         };
-        let listen_signal = listen_signal();
+        tokio::pin!(main_task);
         let res = tokio::select!(
-            res = main_task => res,
-            res = listen_signal => res,
+            res = &mut main_task => res,
+            term = next_signal() => {
+                if term {
+                    // Keep serving until proxies stop sending new connections; a second signal cuts it short.
+                    tokio::select!(
+                        res = &mut main_task => return res,
+                        _ = shutdown.cluster.leave_when_quiet(LEAVE_QUIET, LEAVE_MAX, async { next_signal().await; }) => {}
+                    );
+                }
+                Ok(())
+            }
         );
         shutdown.drain().await;
         res
@@ -352,6 +361,7 @@ impl RendezvousServer {
                 res = listener2.accept() => {
                     match res {
                         Ok((stream, addr))  => {
+                            self.cluster.note_arrival();
                             stream.set_nodelay(true).ok();
                             self.handle_listener2(stream, addr).await;
                         }
@@ -364,6 +374,7 @@ impl RendezvousServer {
                 res = listener3.accept() => {
                     match res {
                         Ok((stream, addr))  => {
+                            self.cluster.note_arrival();
                             stream.set_nodelay(true).ok();
                             self.handle_listener(stream, addr, key, true).await;
                         }
@@ -376,6 +387,7 @@ impl RendezvousServer {
                 res = listener.accept() => {
                     match res {
                         Ok((stream, addr)) => {
+                            self.cluster.note_arrival();
                             stream.set_nodelay(true).ok();
                             self.handle_listener(stream, addr, key, false).await;
                         }
@@ -1684,6 +1696,33 @@ impl RendezvousServer {
     }
 }
 
+/// After SIGTERM: no new connection for this long means the Service and the gateway route elsewhere.
+const LEAVE_QUIET: Duration = Duration::from_secs(2);
+/// Upper bound on staying after SIGTERM, within the pod's termination grace period.
+const LEAVE_MAX: Duration = Duration::from_secs(15);
+
+/// Waits for SIGTERM (true), SIGINT or SIGQUIT (false).
+#[cfg(unix)]
+async fn next_signal() -> bool {
+    use hbb_common::tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut term), Ok(mut int), Ok(mut quit)) =
+        (signal(SignalKind::terminate()), signal(SignalKind::interrupt()), signal(SignalKind::quit()))
+    else {
+        log::error!("cannot listen for signals");
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = term.recv() => { log::info!("signal terminate"); true }
+        _ = int.recv() => { log::info!("signal interrupt"); false }
+        _ = quit.recv() => { log::info!("signal quit"); false }
+    }
+}
+
+#[cfg(not(unix))]
+async fn next_signal() -> bool {
+    std::future::pending().await
+}
+
 impl RendezvousServer {
     /// Closes devices before clearing this pod's (pod, epoch) presence rows, so none is unlisted while still connected here.
     async fn drain(&self) {
@@ -1781,7 +1820,7 @@ impl crate::health::Probe for ServerProbe {
 
     /// Not the database: every pod shares it, and an unready pod's open device flows get reset.
     async fn ready(&self) -> bool {
-        !self.cluster.is_draining()
+        !self.cluster.is_draining() && !self.cluster.is_leaving()
     }
 }
 
@@ -1874,6 +1913,12 @@ impl TestServer {
 
     /// The SIGTERM path; the server keeps answering health checks afterwards.
     pub async fn drain(&self) {
+        self.rs.drain().await;
+    }
+
+    /// SIGTERM with the quiet wait: unready at once, devices closed once connections stop arriving.
+    pub async fn leave(&self, quiet: Duration, max: Duration) {
+        self.rs.cluster.leave_when_quiet(quiet, max, std::future::pending()).await;
         self.rs.drain().await;
     }
 }
