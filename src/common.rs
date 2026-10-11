@@ -11,8 +11,8 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-/// Proxies whose forwarded headers are believed; empty trusts every peer, as before.
-/// `None` (an invalid setting) trusts no peer, so a typo cannot open header spoofing.
+/// Proxies whose forwarded headers are believed; empty trusts none.
+/// `None` (an invalid setting) also trusts no peer; startup refuses it (main.rs).
 pub fn trusted_proxies() -> Option<&'static [ipnetwork::IpNetwork]> {
     static NETS: std::sync::OnceLock<Option<Vec<ipnetwork::IpNetwork>>> = std::sync::OnceLock::new();
     NETS.get_or_init(|| {
@@ -43,11 +43,10 @@ pub fn saturating_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// The client address of a WebSocket handshake: `X-Real-IP`, else the nearest `X-Forwarded-For`
-/// entry not added by a trusted proxy, else the TCP peer. Headers count only from a trusted peer.
+/// The client address of a WebSocket handshake: the nearest `X-Forwarded-For` entry not added by a
+/// trusted proxy, else the TCP peer. The header counts only from a trusted peer.
 pub fn resolve_client_addr(
     peer: SocketAddr,
-    real_ip: Option<&str>,
     forwarded_for: Option<&str>,
     trusted: Option<&[ipnetwork::IpNetwork]>,
 ) -> SocketAddr {
@@ -55,20 +54,16 @@ pub fn resolve_client_addr(
     let Some(trusted) = trusted else {
         return peer;
     };
-    let is_trusted = |ip: std::net::IpAddr| trusted.is_empty() || trusted.iter().any(|n| n.contains(ip));
+    let is_trusted = |ip: std::net::IpAddr| trusted.iter().any(|n| n.contains(ip));
     if !is_trusted(peer.ip()) {
         return peer;
-    }
-    let parse = |v: &str| v.trim().parse::<std::net::IpAddr>().ok();
-    if let Some(ip) = real_ip.and_then(parse) {
-        return SocketAddr::new(ip, 0);
     }
     if let Some(chain) = forwarded_for {
         let mut last_trusted = None;
         for entry in chain.split(',').rev() {
             // Entries left of an unparsable hop were not written by a proxy we can vouch for.
-            let Some(ip) = parse(entry) else { break };
-            if trusted.is_empty() || !is_trusted(ip) {
+            let Some(ip) = entry.trim().parse::<std::net::IpAddr>().ok() else { break };
+            if !is_trusted(ip) {
                 return SocketAddr::new(ip, 0);
             }
             last_trusted = Some(ip);
@@ -76,9 +71,7 @@ pub fn resolve_client_addr(
         if let Some(ip) = last_trusted {
             return SocketAddr::new(ip, 0);
         }
-    }
-    if real_ip.is_some() || forwarded_for.is_some() {
-        log::debug!("Ignoring unparsable forwarded address from {peer}: {real_ip:?} / {forwarded_for:?}");
+        log::debug!("Ignoring unparsable X-Forwarded-For from {peer}: {chain:?}");
     }
     peer
 }
@@ -468,65 +461,72 @@ mod tests {
     const PEER: &str = "10.244.1.2:4000";
 
     #[test]
-    fn resolve_prefers_x_real_ip_from_a_trusted_peer() {
-        let a = resolve_client_addr(PEER.parse().unwrap(), Some("203.0.113.5"), Some("198.51.100.1"), Some(&nets(&["10.244.0.0/16"])));
-        assert_eq!(a.ip().to_string(), "203.0.113.5");
+    fn resolve_ignores_x_real_ip_even_from_a_trusted_peer() {
+        // Callers no longer pass X-Real-IP; a trusted peer with only that header stays the client.
+        let a = resolve_client_addr(PEER.parse().unwrap(), None, Some(&nets(&["10.244.0.0/16"])));
+        assert_eq!(a, PEER.parse::<SocketAddr>().unwrap());
     }
 
     #[test]
     fn resolve_ignores_headers_from_an_untrusted_peer() {
-        let a = resolve_client_addr("192.0.2.9:4000".parse().unwrap(), Some("203.0.113.5"), None, Some(&nets(&["10.244.0.0/16"])));
+        let a = resolve_client_addr("192.0.2.9:4000".parse().unwrap(), Some("203.0.113.5"), Some(&nets(&["10.244.0.0/16"])));
         assert_eq!(a.ip().to_string(), "192.0.2.9");
     }
 
     #[test]
     fn resolve_walks_forwarded_for_past_trusted_hops() {
-        let a = resolve_client_addr(PEER.parse().unwrap(), None, Some("198.51.100.1, 203.0.113.5, 10.244.3.3"), Some(&nets(&["10.244.0.0/16"])));
+        let a = resolve_client_addr(PEER.parse().unwrap(), Some("198.51.100.1, 203.0.113.5, 10.244.3.3"), Some(&nets(&["10.244.0.0/16"])));
         assert_eq!(a.ip().to_string(), "203.0.113.5");
     }
 
     #[test]
-    fn resolve_without_trusted_list_takes_the_nearest_forwarded_entry() {
-        // Before TRUSTED_PROXIES existed a list never parsed; the nearest entry is the closest equivalent.
-        let a = resolve_client_addr(PEER.parse().unwrap(), None, Some("198.51.100.1, 203.0.113.5"), Some(&[]));
-        assert_eq!(a.ip().to_string(), "203.0.113.5");
+    fn resolve_with_an_empty_trusted_list_trusts_no_peer() {
+        let a = resolve_client_addr(PEER.parse().unwrap(), Some("198.51.100.1, 203.0.113.5"), Some(&[]));
+        assert_eq!(a, PEER.parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_takes_the_leftmost_when_every_hop_is_trusted() {
+        let a = resolve_client_addr(PEER.parse().unwrap(), Some("10.244.9.9, 10.244.3.3"), Some(&nets(&["10.244.0.0/16"])));
+        assert_eq!(a.ip().to_string(), "10.244.9.9");
     }
 
     #[test]
     fn resolve_keeps_the_peer_for_bad_or_missing_headers() {
-        assert_eq!(resolve_client_addr(PEER.parse().unwrap(), Some("bogus"), None, Some(&[])), PEER.parse::<SocketAddr>().unwrap());
-        assert_eq!(resolve_client_addr(PEER.parse().unwrap(), None, None, Some(&[])), PEER.parse::<SocketAddr>().unwrap());
+        let t = nets(&["10.244.0.0/16"]);
+        assert_eq!(resolve_client_addr(PEER.parse().unwrap(), Some("bogus"), Some(&t)), PEER.parse::<SocketAddr>().unwrap());
+        assert_eq!(resolve_client_addr(PEER.parse().unwrap(), None, Some(&t)), PEER.parse::<SocketAddr>().unwrap());
     }
 
     #[test]
     fn resolve_handles_ipv6_and_mapped_peers() {
-        let a = resolve_client_addr("[::ffff:10.244.1.2]:4000".parse().unwrap(), Some("2001:db8::7"), None, Some(&nets(&["10.244.0.0/16"])));
+        let a = resolve_client_addr("[::ffff:10.244.1.2]:4000".parse().unwrap(), Some("2001:db8::7"), Some(&nets(&["10.244.0.0/16"])));
         assert_eq!(a.ip().to_string(), "2001:db8::7");
     }
 
     #[test]
     fn resolve_returns_a_mapped_peer_in_canonical_form() {
-        let a = resolve_client_addr("[::ffff:192.0.2.9]:4000".parse().unwrap(), None, None, Some(&nets(&["10.244.0.0/16"])));
+        let a = resolve_client_addr("[::ffff:192.0.2.9]:4000".parse().unwrap(), None, Some(&nets(&["10.244.0.0/16"])));
         assert_eq!(a, "192.0.2.9:4000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
     fn resolve_stops_the_forwarded_walk_at_an_ip_port_hop() {
-        let a = resolve_client_addr(PEER.parse().unwrap(), None, Some("198.51.100.1, 198.51.100.4:5678, 10.244.3.3"), Some(&nets(&["10.244.0.0/16"])));
+        let a = resolve_client_addr(PEER.parse().unwrap(), Some("198.51.100.1, 198.51.100.4:5678, 10.244.3.3"), Some(&nets(&["10.244.0.0/16"])));
         assert_eq!(a.ip().to_string(), "10.244.3.3");
     }
 
     #[test]
     fn resolve_stops_the_forwarded_walk_at_an_unknown_hop() {
-        let a = resolve_client_addr(PEER.parse().unwrap(), None, Some("198.51.100.1, unknown, 10.244.3.3"), Some(&nets(&["10.244.0.0/16"])));
+        let a = resolve_client_addr(PEER.parse().unwrap(), Some("198.51.100.1, unknown, 10.244.3.3"), Some(&nets(&["10.244.0.0/16"])));
         assert_eq!(a.ip().to_string(), "10.244.3.3");
-        let a = resolve_client_addr(PEER.parse().unwrap(), None, Some("198.51.100.1, unknown"), Some(&nets(&["10.244.0.0/16"])));
+        let a = resolve_client_addr(PEER.parse().unwrap(), Some("198.51.100.1, unknown"), Some(&nets(&["10.244.0.0/16"])));
         assert_eq!(a, PEER.parse::<SocketAddr>().unwrap());
     }
 
     #[test]
     fn resolve_trusts_no_peer_when_the_trusted_list_is_invalid() {
-        let a = resolve_client_addr(PEER.parse().unwrap(), Some("203.0.113.5"), Some("198.51.100.1"), None);
+        let a = resolve_client_addr(PEER.parse().unwrap(), Some("198.51.100.1"), None);
         assert_eq!(a, PEER.parse::<SocketAddr>().unwrap());
     }
 

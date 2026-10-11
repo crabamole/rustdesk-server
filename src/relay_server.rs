@@ -533,7 +533,6 @@ async fn make_pair(
             let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
             addr = crate::common::resolve_client_addr(
                 addr,
-                header("X-Real-IP"),
                 header("X-Forwarded-For"),
                 crate::common::trusted_proxies(),
             );
