@@ -1,8 +1,8 @@
 # rustdesk-server
 
-RustDesk ID/rendezvous server (`hbbs`) and relay server (`hbbr`), built to run
-together with [rustdesk-api](https://github.com/crabamole/rustdesk-api)
-on a shared PostgreSQL database.
+RustDesk ID/rendezvous server (`hbbs`) and relay server (`hbbr`) for
+[crabamole](https://github.com/crabamole), built to run together with
+[rustdesk-api](https://github.com/crabamole/rustdesk-api) on a shared PostgreSQL database.
 
 This is a fork of [sctg-development/sctgdesk-server](https://github.com/sctg-development/sctgdesk-server),
 itself based on [rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server).
@@ -14,9 +14,6 @@ Compared to the upstream open-source server it adds:
 - **PostgreSQL** peer storage, shared with rustdesk-api.
 - **Login enforcement**: with `LOGGED_IN_ONLY=Y`, hbbs rejects connection requests
   from clients that are not logged in, validating their tokens against the api-server.
-
-The API server and web console are no longer embedded; they live in
-rustdesk-api.
 
 ## Components and ports
 
@@ -47,7 +44,9 @@ See its README for installation and values.
 
 ### Docker
 
-Images are published to `ghcr.io/crabamole/rustdesk-server:<version>`.
+Images are published to `ghcr.io/crabamole/rustdesk-server:<tag>`; the
+[package page](https://github.com/crabamole/rustdesk-server/pkgs/container/rustdesk-server)
+lists the tags, and each has a git tag of the same name.
 The binaries are in `/usr/local/bin`; the working directory is
 `/usr/local/share/rustdesk-server`, where hbbs keeps its keypair, so mount a volume there.
 
@@ -55,7 +54,7 @@ The binaries are in `/usr/local/bin`; the working directory is
 docker run -d --name hbbr \
   -p 21117:21117 -p 21119:21119 \
   -v "$PWD/data:/usr/local/share/rustdesk-server" \
-  ghcr.io/crabamole/rustdesk-server:1.1.16-2 hbbr
+  ghcr.io/crabamole/rustdesk-server:<tag> hbbr
 
 docker run -d --name hbbs \
   -p 21115:21115 -p 21116:21116 -p 21116:21116/udp -p 21118:21118 \
@@ -63,7 +62,7 @@ docker run -d --name hbbs \
   -e DB_URL=postgres://rustdesk:secret@db.example.com:5432/rustdesk \
   -e API_SERVER=http://api.example.com:21114 \
   -e RELAY_URLS=ws://relay.example.com:21119 \
-  ghcr.io/crabamole/rustdesk-server:1.1.16-2 hbbs
+  ghcr.io/crabamole/rustdesk-server:<tag> hbbs
 ```
 
 ## Keypair
@@ -72,7 +71,7 @@ On first start hbbs writes `id_ed25519` / `id_ed25519.pub` to its working direct
 and logs the public key; clients need that key. To create a keypair yourself:
 
 ```bash
-docker run --rm --entrypoint /usr/local/bin/rustdesk-utils ghcr.io/crabamole/rustdesk-server:1.1.16-2 genkeypair
+docker run --rm --entrypoint /usr/local/bin/rustdesk-utils ghcr.io/crabamole/rustdesk-server:<tag> genkeypair
 ```
 
 Clients built from [crabamole/rustdesk](https://github.com/crabamole/rustdesk) trust only the
