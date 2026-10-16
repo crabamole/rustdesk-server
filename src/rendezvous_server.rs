@@ -527,7 +527,7 @@ impl RendezvousServer {
                         return (true, None);
                     }
                     match admit_viewer(&rf.token, &rf.id).await {
-                        Ok(a) => rf.controlled_context = controlled_context(&a),
+                        Ok(r) => rf.controlled_context = controlled_context(&r),
                         Err(reason) => {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_relay_response(RelayResponse {
@@ -938,8 +938,8 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        let admission = match admit_viewer(&ph.token, &ph.id).await {
-            Ok(a) => a,
+        let audit_ref = match admit_viewer(&ph.token, &ph.id).await {
+            Ok(r) => r,
             Err(reason) => {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -1014,7 +1014,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
-                    controlled_context: controlled_context(&admission),
+                    controlled_context: controlled_context(&audit_ref),
                     ..Default::default()
                 });
             } else {
@@ -1028,7 +1028,7 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
-                    controlled_context: controlled_context(&admission),
+                    controlled_context: controlled_context(&audit_ref),
                     ..Default::default()
                 });
             }
