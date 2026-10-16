@@ -527,7 +527,7 @@ impl RendezvousServer {
                         return (true, None);
                     }
                     match admit_viewer(&rf.token, &rf.id).await {
-                        Ok(r) => rf.controlled_context = controlled_context(&r),
+                        Ok(a) => rf.controlled_context = controlled_context(&a),
                         Err(reason) => {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_relay_response(RelayResponse {
@@ -938,8 +938,8 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        let audit_ref = match admit_viewer(&ph.token, &ph.id).await {
-            Ok(r) => r,
+        let admission = match admit_viewer(&ph.token, &ph.id).await {
+            Ok(a) => a,
             Err(reason) => {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -1014,7 +1014,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
-                    controlled_context: controlled_context(&audit_ref),
+                    controlled_context: controlled_context(&admission),
                     ..Default::default()
                 });
             } else {
@@ -1028,7 +1028,7 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
-                    controlled_context: controlled_context(&audit_ref),
+                    controlled_context: controlled_context(&admission),
                     ..Default::default()
                 });
             }
@@ -2096,9 +2096,32 @@ static API_RETRY_CLIENT: Lazy<Client> =
         Client::new()
     }));
 
+/// What the api-server answered for a viewer: the audit ref and, for the device's owner, its key.
+#[derive(Debug, Default, PartialEq)]
+struct Admission {
+    conn_ref: String,
+    same_user: bool,
+    owner_pk: Vec<u8>,
+}
+
+impl Admission {
+    fn from_answer(v: &serde_json::Value) -> Self {
+        let owner_pk = v["owner_pk"]
+            .as_str()
+            .and_then(|s| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).ok())
+            .unwrap_or_default();
+        Admission {
+            conn_ref: v["ref"].as_str().unwrap_or_default().to_owned(),
+            // The device needs the key to check the flag; a flag without one is useless to it.
+            same_user: v["same_user"].as_bool().unwrap_or(false) && !owner_pk.is_empty(),
+            owner_pk,
+        }
+    }
+}
+
 enum ViewerCheck {
-    /// Token accepted, with its audit ref.
-    User(String),
+    /// Token accepted, with its admission.
+    User(Admission),
     Rejected,
     Unavailable,
 }
@@ -2126,7 +2149,7 @@ async fn check_viewer_token(token: &str, target: &str) -> ViewerCheck {
     };
     match res.status().as_u16() {
         200 => match res.json::<serde_json::Value>().await {
-            Ok(v) => ViewerCheck::User(v["ref"].as_str().unwrap_or_default().to_owned()),
+            Ok(v) => ViewerCheck::User(Admission::from_answer(&v)),
             Err(e) => {
                 log::warn!("bad /api/audit/ref reply: {e}");
                 ViewerCheck::Unavailable
@@ -2140,14 +2163,14 @@ async fn check_viewer_token(token: &str, target: &str) -> ViewerCheck {
     }
 }
 
-/// `Err(reason)` refuses the request; `Ok(ref)` is the audit ref to forward to `target` (may be empty).
-async fn admit_viewer(token: &str, target: &str) -> Result<String, &'static str> {
+/// `Err(reason)` refuses the request; `Ok(admission)` is what to forward to `target` (may be empty).
+async fn admit_viewer(token: &str, target: &str) -> Result<Admission, &'static str> {
     let logged_in_only = std::env::var("LOGGED_IN_ONLY").unwrap_or_default().to_uppercase() == "Y";
     if token.is_empty() {
         return if logged_in_only {
             Err("The connection is not allowed. You have not logged in.")
         } else {
-            Ok(String::new())
+            Ok(Admission::default())
         };
     }
     let check = match timeout(API_CHECK_TIMEOUT_MS, check_viewer_token(token, target)).await {
@@ -2158,18 +2181,20 @@ async fn admit_viewer(token: &str, target: &str) -> Result<String, &'static str>
         }
     };
     match check {
-        ViewerCheck::User(r) => Ok(r),
+        ViewerCheck::User(a) => Ok(a),
         _ if logged_in_only => Err("The connection is not allowed. Your session expired."),
-        _ => Ok(String::new()),
+        _ => Ok(Admission::default()),
     }
 }
 
-fn controlled_context(audit_ref: &str) -> MessageField<ControlledContext> {
-    if audit_ref.is_empty() {
+fn controlled_context(a: &Admission) -> MessageField<ControlledContext> {
+    if a.conn_ref.is_empty() {
         MessageField::none()
     } else {
         MessageField::some(ControlledContext {
-            conn_audit_ref: audit_ref.to_owned(),
+            conn_audit_ref: a.conn_ref.clone(),
+            same_user: a.same_user,
+            owner_pk: a.owner_pk.clone().into(),
             ..Default::default()
         })
     }
@@ -4110,6 +4135,35 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_punch_hole_carries_same_user() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "owned_peer", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub(200, r#"{"ref":"r1","same_user":true,"owner_pk":"AQID"}"#).await), false);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, _) = rs.handle_punch_hole_request(addr, punch("owned_peer", "tok"), "", false).await.unwrap();
+
+            let ctx = &msg.punch_hole().controlled_context;
+            assert_eq!(ctx.conn_audit_ref, "r1");
+            assert!(ctx.same_user);
+            assert_eq!(ctx.owner_pk, vec![1, 2, 3]);
+        }
+
+        #[tokio::test]
+        async fn test_same_user_without_owner_key_is_dropped() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "owned_peer2", "10.0.0.5:5000").await;
+
+            set_env(Some(&api_stub(200, r#"{"ref":"r1","same_user":true,"owner_pk":""}"#).await), false);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, _) = rs.handle_punch_hole_request(addr, punch("owned_peer2", "tok"), "", false).await.unwrap();
+
+            assert!(!msg.punch_hole().controlled_context.same_user);
+        }
+
+        #[tokio::test]
         async fn test_audit_ref_request_names_the_target_device() {
             let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server_with_sk().await;
@@ -4165,8 +4219,8 @@ mod tests {
             set_env(Some(&url), true);
 
             let (a, b) = tokio::join!(admit_viewer("tok", "dev"), admit_viewer("tok", "dev"));
-            assert_eq!((a, b), (Ok("r1".to_owned()), Ok("r1".to_owned())));
-            assert_eq!(admit_viewer("tok", "dev").await, Ok("r1".to_owned()));
+            assert_eq!((a.map(|a| a.conn_ref), b.map(|a| a.conn_ref)), (Ok("r1".to_owned()), Ok("r1".to_owned())));
+            assert_eq!(admit_viewer("tok", "dev").await.map(|a| a.conn_ref), Ok("r1".to_owned()));
         }
 
         #[tokio::test]
