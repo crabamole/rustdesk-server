@@ -146,6 +146,17 @@ impl Database {
         }
     }
 
+    /// Stores `pk` as the key of device `guid` when its owner approved that key
+    /// (`approved_pk`); the approval is used up.
+    pub async fn take_approved_pk(&self, guid: &[u8], pk: &[u8]) -> ResultType<bool> {
+        let r = sqlx::query("UPDATE peer SET pk = $2, approved_pk = NULL WHERE guid = $1 AND approved_pk = $2")
+            .bind(guid)
+            .bind(pk)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
     pub async fn update_pk(
         &self,
         guid: &Vec<u8>,

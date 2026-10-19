@@ -18,3 +18,5 @@ CREATE INDEX IF NOT EXISTS index_peer_user on peer ("user");
 CREATE INDEX IF NOT EXISTS index_peer_created_at on peer (created_at);
 CREATE INDEX IF NOT EXISTS index_peer_status on peer (status);
 CREATE INDEX IF NOT EXISTS index_peer_strategy ON peer (strategy);
+-- rustdesk-api libs/state/migrations/0017_peer_approved_pk.sql
+ALTER TABLE peer ADD COLUMN IF NOT EXISTS approved_pk bytea;

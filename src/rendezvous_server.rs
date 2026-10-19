@@ -718,16 +718,24 @@ impl RendezvousServer {
             //return Err(send_rk_res(socket, addr, TOO_FREQUENT).await);
         }
         let peer = self.pm.get_or(&id).await;
-        let (changed, ip_changed) = {
+        let (changed, ip_changed) = 'known: {
             let peer = peer.read().await;
             if peer.uuid.is_empty() {
                 (true, false)
             } else {
                 if peer.uuid == rk.uuid {
                     if !peer.pk.is_empty() && peer.pk != rk.pk {
-                        log::warn!("Peer {} key change refused from {}: {:?} vs {:?}", id, ip, rk.pk, peer.pk);
+                        let (guid, ip_changed) = (peer.guid.clone(), peer.info.ip != ip);
                         drop(peer);
-                        return Err(KEY_CHANGE_REFUSED);
+                        if !self.pm.db.take_approved_pk(&guid, &rk.pk).await.unwrap_or_else(|e| {
+                            log::error!("db.take_approved_pk failed: {}", e);
+                            false
+                        }) {
+                            log::warn!("Peer {} key change refused from {}: {:?}", id, ip, rk.pk);
+                            return Err(KEY_CHANGE_REFUSED);
+                        }
+                        log::info!("Peer {} key change approved by its owner, from {}", id, ip);
+                        break 'known (true, ip_changed);
                     }
                 } else {
                     log::warn!(
@@ -2697,6 +2705,34 @@ mod tests {
             assert!(matches!(result, Ok((register_pk_response::Result::OK, _))), "{result:?}");
             let row = rs.pm.db.get_peer("peer_reset").await.unwrap().unwrap();
             assert_eq!(row.pk, vec![3; 32]);
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_takes_the_key_its_owner_approved() {
+            let (mut rs, _rx) = test_server().await;
+            rs.handle_register_pk(rk_key("peer_approved", 2), "10.0.0.1:1".parse().unwrap()).await.unwrap();
+            sqlx::query("UPDATE peer SET approved_pk = $1 WHERE id = 'peer_approved'")
+                .bind(vec![3u8; 32]).execute(rs.pm.db.pool()).await.unwrap();
+            let result = rs.handle_register_pk(rk_key("peer_approved", 3), "10.0.0.2:1".parse().unwrap()).await;
+            assert!(matches!(result, Ok((register_pk_response::Result::OK, _))), "{result:?}");
+            let (pk, approved): (Vec<u8>, Option<Vec<u8>>) =
+                sqlx::query_as("SELECT pk, approved_pk FROM peer WHERE id = 'peer_approved'")
+                    .fetch_one(rs.pm.db.pool()).await.unwrap();
+            assert_eq!((pk, approved), (vec![3; 32], None));
+        }
+
+        #[tokio::test]
+        async fn test_register_pk_refuses_a_key_its_owner_did_not_approve() {
+            let (mut rs, _rx) = test_server().await;
+            rs.handle_register_pk(rk_key("peer_unapproved", 2), "10.0.0.1:1".parse().unwrap()).await.unwrap();
+            sqlx::query("UPDATE peer SET approved_pk = $1 WHERE id = 'peer_unapproved'")
+                .bind(vec![4u8; 32]).execute(rs.pm.db.pool()).await.unwrap();
+            let result = rs.handle_register_pk(rk_key("peer_unapproved", 3), "10.0.0.1:1".parse().unwrap()).await;
+            assert_eq!(result, Err(KEY_CHANGE_REFUSED));
+            let (pk, approved): (Vec<u8>, Option<Vec<u8>>) =
+                sqlx::query_as("SELECT pk, approved_pk FROM peer WHERE id = 'peer_unapproved'")
+                    .fetch_one(rs.pm.db.pool()).await.unwrap();
+            assert_eq!((pk, approved), (vec![2; 32], Some(vec![4; 32])));
         }
 
         #[tokio::test]
