@@ -13,7 +13,7 @@ use hbb_common::{
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::{
-        register_pk_response::Result::{INVALID_ID_FORMAT, TOO_FREQUENT, UUID_MISMATCH},
+        register_pk_response::Result::{INVALID_ID_FORMAT, KEY_CHANGE_REFUSED, TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
     sodiumoxide::crypto::{
@@ -724,18 +724,10 @@ impl RendezvousServer {
                 (true, false)
             } else {
                 if peer.uuid == rk.uuid {
-                    if peer.info.ip != ip && peer.pk != rk.pk {
-                        log::warn!(
-                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                            id,
-                            ip,
-                            rk.pk,
-                            peer.info.ip,
-                            peer.pk,
-                        );
+                    if !peer.pk.is_empty() && peer.pk != rk.pk {
+                        log::warn!("Peer {} key change refused from {}: {:?} vs {:?}", id, ip, rk.pk, peer.pk);
                         drop(peer);
-                        return Err(UUID_MISMATCH);
-                        //return Err(send_rk_res(socket, addr, UUID_MISMATCH).await);
+                        return Err(KEY_CHANGE_REFUSED);
                     }
                 } else {
                     log::warn!(
@@ -2672,30 +2664,39 @@ mod tests {
             assert!(matches!(result, Ok((register_pk_response::Result::OK, _))));
         }
 
+        fn rk_key(id: &str, pk: u8) -> RegisterPk {
+            RegisterPk { id: id.to_owned(), uuid: vec![1; 16].into(), pk: vec![pk; 32].into(), ..Default::default() }
+        }
+
         #[tokio::test]
-        async fn test_register_pk_same_uuid_updates() {
+        async fn test_register_pk_refuses_another_key_for_a_known_device() {
             let (mut rs, _rx) = test_server().await;
-            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            rs.handle_register_pk(rk_key("peer_key", 2), "10.0.0.1:1".parse().unwrap()).await.unwrap();
+            for ip in ["10.0.0.1:1", "10.0.0.2:1"] {
+                let result = rs.handle_register_pk(rk_key("peer_key", 3), ip.parse().unwrap()).await;
+                assert_eq!(result, Err(KEY_CHANGE_REFUSED), "from {ip}");
+            }
+            let row = rs.pm.db.get_peer("peer_key").await.unwrap().unwrap();
+            assert_eq!(row.pk, vec![2; 32]);
+        }
 
-            // First registration
-            let rk = RegisterPk {
-                id: "peer_upd".to_owned(),
-                uuid: vec![1; 16].into(),
-                pk: vec![2; 32].into(),
-                ..Default::default()
-            };
-            let result = rs.handle_register_pk(rk, addr).await;
-            assert!(matches!(result, Ok((register_pk_response::Result::OK, _))));
+        #[tokio::test]
+        async fn test_register_pk_same_key_from_a_new_ip_updates() {
+            let (mut rs, _rx) = test_server().await;
+            rs.handle_register_pk(rk_key("peer_move", 2), "10.0.0.1:1".parse().unwrap()).await.unwrap();
+            let result = rs.handle_register_pk(rk_key("peer_move", 2), "10.0.0.2:1".parse().unwrap()).await;
+            assert!(matches!(result, Ok((register_pk_response::Result::OK, _))), "{result:?}");
+        }
 
-            // Second registration with same uuid
-            let rk = RegisterPk {
-                id: "peer_upd".to_owned(),
-                uuid: vec![1; 16].into(),
-                pk: vec![3; 32].into(),
-                ..Default::default()
-            };
-            let result = rs.handle_register_pk(rk, addr).await;
-            assert!(matches!(result, Ok((register_pk_response::Result::OK, _))));
+        #[tokio::test]
+        async fn test_register_pk_takes_a_new_key_after_a_reset() {
+            let (mut rs, _rx) = test_server().await;
+            rs.handle_register_pk(rk_key("peer_reset", 2), "10.0.0.1:1".parse().unwrap()).await.unwrap();
+            sqlx::query("UPDATE peer SET pk = '' WHERE id = 'peer_reset'").execute(rs.pm.db.pool()).await.unwrap();
+            let result = rs.handle_register_pk(rk_key("peer_reset", 3), "10.0.0.2:1".parse().unwrap()).await;
+            assert!(matches!(result, Ok((register_pk_response::Result::OK, _))), "{result:?}");
+            let row = rs.pm.db.get_peer("peer_reset").await.unwrap().unwrap();
+            assert_eq!(row.pk, vec![3; 32]);
         }
 
         #[tokio::test]
@@ -2719,33 +2720,6 @@ mod tests {
                 ..Default::default()
             };
             let result = rs.handle_register_pk(rk, addr).await;
-            assert_eq!(result, Err(UUID_MISMATCH));
-        }
-
-        #[tokio::test]
-        async fn test_register_pk_ip_pk_mismatch_rejected() {
-            IP_BLOCKER.lock().await.clear();
-            let (mut rs, _rx) = test_server().await;
-            let addr1: SocketAddr = "10.0.0.1:1234".parse().unwrap();
-            let addr2: SocketAddr = "10.0.0.2:1234".parse().unwrap();
-
-            // First registration
-            let rk = RegisterPk {
-                id: "peer_ipm".to_owned(),
-                uuid: vec![1; 16].into(),
-                pk: vec![2; 32].into(),
-                ..Default::default()
-            };
-            rs.handle_register_pk(rk, addr1).await.unwrap();
-
-            // Same uuid, different IP AND different PK
-            let rk = RegisterPk {
-                id: "peer_ipm".to_owned(),
-                uuid: vec![1; 16].into(),
-                pk: vec![3; 32].into(),
-                ..Default::default()
-            };
-            let result = rs.handle_register_pk(rk, addr2).await;
             assert_eq!(result, Err(UUID_MISMATCH));
         }
 
