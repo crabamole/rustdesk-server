@@ -149,8 +149,6 @@ impl Database {
     }
 
     /// Device `id`'s admission state (rustdesk docs/design-device-admission.md); None for an unknown ID.
-    // Task 6 (enforcement) is the first production caller.
-    #[allow(dead_code)]
     pub async fn peer_admission(&self, id: &str) -> ResultType<Option<i16>> {
         Ok(sqlx::query_scalar("SELECT admission FROM peer WHERE id = $1")
             .bind(id)

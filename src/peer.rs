@@ -79,6 +79,7 @@ pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 pub(crate) struct PeerMap {
     map: Arc<RwLock<HashMap<String, LockPeer>>>,
     pub(crate) db: database::Database,
+    pub(crate) admission: crate::admission::DeviceAdmission,
 }
 
 impl PeerMap {
@@ -92,6 +93,7 @@ impl PeerMap {
         Ok(Self {
             map: Default::default(),
             db: database::Database::connect_with_retry(&db_url).await,
+            admission: crate::admission::DeviceAdmission::from_env(),
         })
     }
 
@@ -119,7 +121,7 @@ impl PeerMap {
             )
         };
         if guid.is_empty() {
-            match self.db.insert_peer(&id, &uuid, &pk, &info_str, crate::admission::ADMITTED).await {
+            match self.db.insert_peer(&id, &uuid, &pk, &info_str, self.admission.new_device_state()).await {
                 Err(err) => {
                     log::error!("db.insert_peer failed: {}", err);
                     return register_pk_response::Result::SERVER_ERROR;
@@ -193,6 +195,7 @@ impl PeerMap {
         PeerMap {
             map: Default::default(),
             db,
+            admission: Default::default(),
         }
     }
 }

@@ -526,6 +526,16 @@ impl RendezvousServer {
                         allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
                         return (true, None);
                     }
+                    if let Some(reason) = self.pm.admission.refusal(&self.pm.db, &rf.id).await {
+                        log::trace!("relay to {} refused: not admitted", rf.id);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            refuse_reason: reason.into(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return (true, None);
+                    }
                     match admit_viewer(&rf.token, &rf.id).await {
                         Ok(r) => rf.controlled_context = controlled_context(&r),
                         Err(reason) => {
@@ -934,6 +944,15 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if let Some(reason) = self.pm.admission.refusal(&self.pm.db, &ph.id).await {
+            log::trace!("punch hole to {} refused: not admitted", ph.id);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: reason.into(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
@@ -4352,6 +4371,55 @@ mod tests {
             let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
             assert!(reply.has_relay_response());
             assert!(reply.relay_response().refuse_reason.contains("not logged in"));
+        }
+
+        #[tokio::test]
+        async fn punch_hole_to_a_device_that_is_not_admitted_is_refused() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            rs.pm.admission = crate::admission::DeviceAdmission::new(true);
+            register_peer(&mut rs, "adm_ph", "10.0.0.5:5000").await;
+            set_env(None, false);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("adm_ph", ""), "", false).await.unwrap();
+            assert!(to.is_none());
+            assert_eq!(msg.punch_hole_response().other_failure, crate::admission::NOT_ADMITTED);
+
+            sqlx::query("UPDATE peer SET admission = 1 WHERE id = 'adm_ph'").execute(rs.pm.db.pool()).await.unwrap();
+            rs.pm.admission = crate::admission::DeviceAdmission::new(true); // empty cache
+            let (msg, _) = rs.handle_punch_hole_request(addr, punch("adm_ph", ""), "", false).await.unwrap();
+            assert!(!msg.has_punch_hole_response() || msg.punch_hole_response().other_failure.is_empty());
+        }
+
+        #[tokio::test]
+        async fn request_relay_to_a_device_that_is_not_admitted_is_refused() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, mut rx) = test_server_with_sk().await;
+            rs.pm.admission = crate::admission::DeviceAdmission::new(true);
+            register_peer(&mut rs, "adm_rr", "10.0.0.5:9000").await;
+            let (sink, mut client) = tcp_sink().await;
+            let mut sink = Some(sink);
+            set_env(None, false);
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let result = rs.handle_tcp(&relay_bytes("adm_rr", ""), &mut sink, addr, "", false).await;
+            assert!(result.0);
+            assert!(rx.try_recv().is_err(), "nothing must reach the target");
+            let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
+            let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
+            assert_eq!(reply.relay_response().refuse_reason, crate::admission::NOT_ADMITTED);
+        }
+
+        #[tokio::test]
+        async fn a_device_that_is_not_admitted_can_still_connect_out() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "adm_target", "10.0.0.6:5000").await; // admission off: admitted
+            rs.pm.admission = crate::admission::DeviceAdmission::new(true);
+            register_peer(&mut rs, "adm_viewer", "10.0.0.7:5000").await; // pending
+            set_env(None, false);
+            let viewer: SocketAddr = "10.0.0.7:5000".parse().unwrap();
+            let (msg, _) = rs.handle_punch_hole_request(viewer, punch("adm_target", ""), "", false).await.unwrap();
+            assert!(!msg.has_punch_hole_response() || msg.punch_hole_response().other_failure.is_empty());
         }
 
         #[tokio::test]
