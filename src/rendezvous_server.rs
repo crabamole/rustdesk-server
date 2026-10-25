@@ -526,8 +526,18 @@ impl RendezvousServer {
                         allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
                         return (true, None);
                     }
-                    if let Some(reason) = self.pm.admission.refusal(&self.pm.db, &rf.id).await {
-                        log::trace!("relay to {} refused: not admitted", rf.id);
+                    // A viewer with a token is checked for admission before the api-server is asked,
+                    // so a refused connection opens no audit record. One without gets the login check first.
+                    let not_admitted = self.pm.admission.refusal(&self.pm.db, &rf.id).await;
+                    let mut refusal = not_admitted.filter(|_| !rf.token.is_empty());
+                    if refusal.is_none() {
+                        match admit_viewer(&rf.token, &rf.id).await {
+                            Ok(r) => rf.controlled_context = controlled_context(&r),
+                            Err(reason) => refusal = Some(reason),
+                        }
+                    }
+                    if let Some(reason) = refusal.or(not_admitted) {
+                        log::trace!("relay to {} refused: {}", rf.id, reason);
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_relay_response(RelayResponse {
                             refuse_reason: reason.into(),
@@ -535,18 +545,6 @@ impl RendezvousServer {
                         });
                         allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
                         return (true, None);
-                    }
-                    match admit_viewer(&rf.token, &rf.id).await {
-                        Ok(r) => rf.controlled_context = controlled_context(&r),
-                        Err(reason) => {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_relay_response(RelayResponse {
-                                refuse_reason: reason.into(),
-                                ..Default::default()
-                            });
-                            allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
-                            return (true, None);
-                        }
                     }
                     // The target never needs the viewer's token.
                     rf.token.clear();
@@ -948,8 +946,19 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        if let Some(reason) = self.pm.admission.refusal(&self.pm.db, &ph.id).await {
-            log::trace!("punch hole to {} refused: not admitted", ph.id);
+        // A viewer with a token is checked for admission before the api-server is asked,
+        // so a refused connection opens no audit record. One without gets the login check first.
+        let not_admitted = self.pm.admission.refusal(&self.pm.db, &ph.id).await;
+        let mut refusal = not_admitted.filter(|_| !ph.token.is_empty());
+        let mut audit_ref = Admission::default();
+        if refusal.is_none() {
+            match admit_viewer(&ph.token, &ph.id).await {
+                Ok(r) => audit_ref = r,
+                Err(reason) => refusal = Some(reason),
+            }
+        }
+        if let Some(reason) = refusal.or(not_admitted) {
+            log::trace!("punch hole to {} refused: {}", ph.id, reason);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 other_failure: reason.into(),
@@ -957,17 +966,6 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        let audit_ref = match admit_viewer(&ph.token, &ph.id).await {
-            Ok(r) => r,
-            Err(reason) => {
-                let mut msg_out = RendezvousMessage::new();
-                msg_out.set_punch_hole_response(PunchHoleResponse {
-                    other_failure: reason.into(),
-                    ..Default::default()
-                });
-                return Ok((msg_out, None));
-            }
-        };
         let id = ph.id;
         // punch hole request from A, relay to B,
         // check if in same intranet first,
@@ -4407,6 +4405,37 @@ mod tests {
             let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
             let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
             assert_eq!(reply.relay_response().refuse_reason, crate::admission::NOT_ADMITTED);
+        }
+
+        #[tokio::test]
+        async fn anonymous_punch_hole_to_a_pending_device_gets_the_login_refusal() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            rs.pm.admission = crate::admission::DeviceAdmission::new(true);
+            register_peer(&mut rs, "adm_ph_anon", "10.0.0.5:5000").await;
+            set_env(None, true);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("adm_ph_anon", ""), "", false).await.unwrap();
+            assert!(to.is_none());
+            assert!(msg.punch_hole_response().other_failure.contains("not logged in"));
+        }
+
+        #[tokio::test]
+        async fn anonymous_request_relay_to_a_pending_device_gets_the_login_refusal() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, mut rx) = test_server_with_sk().await;
+            rs.pm.admission = crate::admission::DeviceAdmission::new(true);
+            register_peer(&mut rs, "adm_rr_anon", "10.0.0.5:9000").await;
+            let (sink, mut client) = tcp_sink().await;
+            let mut sink = Some(sink);
+            set_env(None, true);
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let result = rs.handle_tcp(&relay_bytes("adm_rr_anon", ""), &mut sink, addr, "", false).await;
+            assert!(result.0);
+            assert!(rx.try_recv().is_err(), "nothing must reach the target");
+            let frame = timeout(5000, client.next()).await.unwrap().unwrap().unwrap();
+            let reply = RendezvousMessage::parse_from_bytes(&frame).unwrap();
+            assert!(reply.relay_response().refuse_reason.contains("not logged in"));
         }
 
         #[tokio::test]
