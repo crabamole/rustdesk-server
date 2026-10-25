@@ -20,3 +20,7 @@ CREATE INDEX IF NOT EXISTS index_peer_status on peer (status);
 CREATE INDEX IF NOT EXISTS index_peer_strategy ON peer (strategy);
 -- rustdesk-api libs/state/migrations/0017_peer_approved_pk.sql
 ALTER TABLE peer ADD COLUMN IF NOT EXISTS approved_pk bytea;
+-- rustdesk-api libs/state/migrations/0019_peer_admission.sql
+ALTER TABLE peer ADD COLUMN IF NOT EXISTS admission smallint NOT NULL DEFAULT 1;
+ALTER TABLE peer ADD COLUMN IF NOT EXISTS admission_at text;
+ALTER TABLE peer ADD COLUMN IF NOT EXISTS admission_by text;

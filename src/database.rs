@@ -123,10 +123,11 @@ impl Database {
         uuid: &[u8],
         pk: &[u8],
         info: &str,
+        admission: i16,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
         let row: Option<(Vec<u8>,)> = sqlx::query_as(
-            "INSERT INTO peer(guid, id, uuid, pk, info) VALUES($1, $2, $3, $4, $5) \
+            "INSERT INTO peer(guid, id, uuid, pk, info, admission) VALUES($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (id) DO UPDATE SET pk = EXCLUDED.pk, \
              info = (COALESCE(NULLIF(peer.info, ''), '{}')::jsonb \
                      || COALESCE(NULLIF(EXCLUDED.info, ''), '{}')::jsonb)::text \
@@ -138,12 +139,23 @@ impl Database {
         .bind(uuid)
         .bind(pk)
         .bind(info)
+        .bind(admission)
         .fetch_optional(&self.pool)
         .await?;
         match row {
             Some((guid,)) => Ok(guid),
             None => bail!("peer {id} is registered with another uuid"),
         }
+    }
+
+    /// Device `id`'s admission state (rustdesk docs/design-device-admission.md); None for an unknown ID.
+    // Task 6 (enforcement) is the first production caller.
+    #[allow(dead_code)]
+    pub async fn peer_admission(&self, id: &str) -> ResultType<Option<i16>> {
+        Ok(sqlx::query_scalar("SELECT admission FROM peer WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
     }
 
     /// Stores `pk` as the key of device `guid` when its owner approved that key
@@ -246,7 +258,7 @@ mod tests {
     }
 
     db_test!(status_and_user_decode, |db| {
-        let guid = db.insert_peer("status_peer", b"u", b"p", "{}").await.unwrap();
+        let guid = db.insert_peer("status_peer", b"u", b"p", "{}", 1).await.unwrap();
         let peer = db.get_peer("status_peer").await.unwrap().unwrap();
         assert_eq!(peer.status, 1, "status smallint default 1 decoded wrong");
         assert_eq!(peer.user, None);
@@ -258,7 +270,7 @@ mod tests {
         let pk = b"test-pk-bytes!!!";
         let info = r#"{"ip":"10.0.0.1"}"#;
 
-        let guid = db.insert_peer("peer123", uuid, pk, info).await.unwrap();
+        let guid = db.insert_peer("peer123", uuid, pk, info, 1).await.unwrap();
         assert!(!guid.is_empty());
 
         let peer = db.get_peer("peer123").await.unwrap().unwrap();
@@ -278,7 +290,7 @@ mod tests {
         let pk = b"test-pk-bytes!!!";
         let info = r#"{"ip":"10.0.0.1"}"#;
 
-        let guid = db.insert_peer("peer456", uuid, pk, info).await.unwrap();
+        let guid = db.insert_peer("peer456", uuid, pk, info, 1).await.unwrap();
 
         let new_pk = b"new-pk-bytes!!!!!";
         let new_info = r#"{"ip":"10.0.0.2"}"#;
@@ -297,7 +309,7 @@ mod tests {
         let pk = b"test-pk-bytes!!!";
         let info = r#"{"hostname":"ws-1","ip":"10.0.0.1"}"#;
 
-        let guid = db.insert_peer("peer789", uuid, pk, info).await.unwrap();
+        let guid = db.insert_peer("peer789", uuid, pk, info, 1).await.unwrap();
 
         let new_pk = b"new-pk-bytes!!!!!";
         let new_info = r#"{"ip":"203.0.113.5"}"#;
@@ -313,7 +325,7 @@ mod tests {
         let uuid = b"test-uuid-bytes!";
         let pk = b"test-pk-bytes!!!";
 
-        let guid = db.insert_peer("peer_empty_info", uuid, pk, "").await.unwrap();
+        let guid = db.insert_peer("peer_empty_info", uuid, pk, "", 1).await.unwrap();
 
         let new_pk = b"new-pk-bytes!!!!!";
         let new_info = r#"{"ip":"203.0.113.5"}"#;
@@ -334,8 +346,8 @@ mod tests {
     }
 
     db_test!(insert_same_id_and_uuid_keeps_the_row, |db| {
-        let first = db.insert_peer("dup_id", b"uuid-1", b"pk-1", r#"{"ip":"10.0.0.1"}"#).await.unwrap();
-        let second = db.insert_peer("dup_id", b"uuid-1", b"pk-2", r#"{"ip":"10.0.0.2"}"#).await.unwrap();
+        let first = db.insert_peer("dup_id", b"uuid-1", b"pk-1", r#"{"ip":"10.0.0.1"}"#, 1).await.unwrap();
+        let second = db.insert_peer("dup_id", b"uuid-1", b"pk-2", r#"{"ip":"10.0.0.2"}"#, 1).await.unwrap();
         assert_eq!(first, second);
         let peer = db.get_peer("dup_id").await.unwrap().unwrap();
         assert_eq!(peer.pk, b"pk-2".to_vec());
@@ -344,16 +356,25 @@ mod tests {
     });
 
     db_test!(insert_same_id_other_uuid_fails, |db| {
-        db.insert_peer("dup_id2", b"uuid-1", b"pk", "{}").await.unwrap();
-        assert!(db.insert_peer("dup_id2", b"uuid-2", b"pk", "{}").await.is_err());
+        db.insert_peer("dup_id2", b"uuid-1", b"pk", "{}", 1).await.unwrap();
+        assert!(db.insert_peer("dup_id2", b"uuid-2", b"pk", "{}", 1).await.is_err());
         assert_eq!(db.get_peer("dup_id2").await.unwrap().unwrap().uuid, b"uuid-1".to_vec());
+    });
+
+    db_test!(insert_peer_sets_admission_once, |db| {
+        db.insert_peer("adm_new", b"uuid-a", b"pk-1", "{}", 0).await.unwrap();
+        assert_eq!(db.peer_admission("adm_new").await.unwrap(), Some(0));
+        // Same device registering again (e.g. after an hbbs restart) keeps its state.
+        db.insert_peer("adm_new", b"uuid-a", b"pk-1", "{}", 1).await.unwrap();
+        assert_eq!(db.peer_admission("adm_new").await.unwrap(), Some(0));
+        assert_eq!(db.peer_admission("nobody").await.unwrap(), None);
     });
 
     db_test!(racing_first_registrations_agree, |db| {
         let jobs: Vec<_> = (0..8)
             .map(|_| {
                 let db = db.clone();
-                tokio::spawn(async move { db.insert_peer("race_id", b"u", b"p", "{}").await.unwrap() })
+                tokio::spawn(async move { db.insert_peer("race_id", b"u", b"p", "{}", 1).await.unwrap() })
             })
             .collect();
         let guids: std::collections::HashSet<Vec<u8>> = hbb_common::futures::future::join_all(jobs)
@@ -368,7 +389,7 @@ mod tests {
         let uuid = b"test-uuid-bytes!";
         let pk = b"test-pk-bytes!!!";
 
-        let guid = db.insert_peer("old_id", uuid, pk, "{}").await.unwrap();
+        let guid = db.insert_peer("old_id", uuid, pk, "{}", 1).await.unwrap();
         db.update_pk(&guid, "new_id", pk, "{}").await.unwrap();
 
         let old = db.get_peer("old_id").await.unwrap();
@@ -418,7 +439,7 @@ mod tests {
             let id = i.to_string();
             jobs.push(tokio::spawn(async move {
                 let empty_vec = Vec::new();
-                cloned.insert_peer(&id, &empty_vec, &empty_vec, "").await.unwrap();
+                cloned.insert_peer(&id, &empty_vec, &empty_vec, "", 1).await.unwrap();
             }));
         }
         for i in 0..100 {

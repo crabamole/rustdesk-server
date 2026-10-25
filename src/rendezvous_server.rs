@@ -4605,7 +4605,7 @@ mod tests {
             let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let (pod1, mut calls) = remote_pod(&rs, true).await;
-            rs.pm.db.insert_peer("fwd_dev1", b"u", b"p", r#"{"ip":"10.1.2.3"}"#).await.unwrap();
+            rs.pm.db.insert_peer("fwd_dev1", b"u", b"p", r#"{"ip":"10.1.2.3"}"#, 1).await.unwrap();
             pod1.register("fwd_dev1", 1).await;
             let (sink, _client) = logged_in_only_tests::tcp_sink().await;
             let mut sink = Some(sink);
@@ -4628,7 +4628,7 @@ mod tests {
             let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let (pod1, mut calls) = remote_pod(&rs, false).await;
-            rs.pm.db.insert_peer("fwd_dev2", b"u", b"p", r#"{"ip":"10.1.2.3"}"#).await.unwrap();
+            rs.pm.db.insert_peer("fwd_dev2", b"u", b"p", r#"{"ip":"10.1.2.3"}"#, 1).await.unwrap();
             pod1.register("fwd_dev2", 1).await;
             let (sink, mut client) = logged_in_only_tests::tcp_sink().await;
             let mut sink = Some(sink);
@@ -4646,7 +4646,7 @@ mod tests {
             let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let (pod1, _calls) = remote_pod(&rs, true).await;
-            rs.pm.db.insert_peer("fwd_dev3", b"u", b"p", "{}").await.unwrap();
+            rs.pm.db.insert_peer("fwd_dev3", b"u", b"p", "{}", 1).await.unwrap();
             pod1.register("fwd_dev3", 1).await;
             sqlx::query("UPDATE hbbs_pod SET alive_at = now() - interval '31 seconds' WHERE pod = 'hbbs-1'")
                 .execute(rs.pm.db.pool())
@@ -4663,7 +4663,7 @@ mod tests {
             let _guard = EnvGuard::acquire().await;
             let (mut rs, _rx) = test_server().await;
             let (pod1, _calls) = remote_pod(&rs, true).await;
-            rs.pm.db.insert_peer("fwd_dev4", b"u", b"p", r#"{"ip":"10.1.2.3"}"#).await.unwrap();
+            rs.pm.db.insert_peer("fwd_dev4", b"u", b"p", r#"{"ip":"10.1.2.3"}"#, 1).await.unwrap();
             pod1.register("fwd_dev4", 1).await;
             let ph = PunchHoleRequest { id: "fwd_dev4".to_owned(), ..Default::default() };
             let (msg, to) = rs.handle_punch_hole_request("10.0.0.1:1234".parse().unwrap(), ph, "", true).await.unwrap();

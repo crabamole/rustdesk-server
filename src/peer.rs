@@ -119,7 +119,7 @@ impl PeerMap {
             )
         };
         if guid.is_empty() {
-            match self.db.insert_peer(&id, &uuid, &pk, &info_str).await {
+            match self.db.insert_peer(&id, &uuid, &pk, &info_str, crate::admission::ADMITTED).await {
                 Err(err) => {
                     log::error!("db.insert_peer failed: {}", err);
                     return register_pk_response::Result::SERVER_ERROR;
@@ -383,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn get_does_not_cache_stored_rows() {
         let pm = temp_peer_map().await;
-        pm.db.insert_peer("stored_only", b"u", b"p", "{}").await.unwrap();
+        pm.db.insert_peer("stored_only", b"u", b"p", "{}", 1).await.unwrap();
         assert!(pm.get("stored_only").await.is_some());
         assert!(!pm.is_in_memory("stored_only").await);
     }
@@ -415,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_adopts_the_stored_row() {
         let pm = temp_peer_map().await;
-        let guid = pm.db.insert_peer("adopt_me", b"u", b"p", "{}").await.unwrap();
+        let guid = pm.db.insert_peer("adopt_me", b"u", b"p", "{}", 1).await.unwrap();
         let p = pm.get_or("adopt_me").await;
         assert_eq!(p.read().await.guid, guid);
         assert!(pm.is_in_memory("adopt_me").await);
