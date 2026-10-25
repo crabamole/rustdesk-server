@@ -526,17 +526,19 @@ impl RendezvousServer {
                         allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
                         return (true, None);
                     }
-                    // A viewer with a token is checked for admission before the api-server is asked,
-                    // so a refused connection opens no audit record. One without gets the login check first.
-                    let not_admitted = self.pm.admission.refusal(&self.pm.db, &rf.id).await;
-                    let mut refusal = not_admitted.filter(|_| !rf.token.is_empty());
-                    if refusal.is_none() {
-                        match admit_viewer(&rf.token, &rf.id).await {
-                            Ok(r) => rf.controlled_context = controlled_context(&r),
-                            Err(reason) => refusal = Some(reason),
+                    match admit_viewer(&rf.token, &rf.id).await {
+                        Ok(r) => rf.controlled_context = controlled_context(&r),
+                        Err(reason) => {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_relay_response(RelayResponse {
+                                refuse_reason: reason.into(),
+                                ..Default::default()
+                            });
+                            allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                            return (true, None);
                         }
                     }
-                    if let Some(reason) = refusal.or(not_admitted) {
+                    if let Some(reason) = self.pm.admission.refusal(&self.pm.db, &rf.id).await {
                         log::trace!("relay to {} refused: {}", rf.id, reason);
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_relay_response(RelayResponse {
@@ -946,18 +948,18 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        // A viewer with a token is checked for admission before the api-server is asked,
-        // so a refused connection opens no audit record. One without gets the login check first.
-        let not_admitted = self.pm.admission.refusal(&self.pm.db, &ph.id).await;
-        let mut refusal = not_admitted.filter(|_| !ph.token.is_empty());
-        let mut audit_ref = Admission::default();
-        if refusal.is_none() {
-            match admit_viewer(&ph.token, &ph.id).await {
-                Ok(r) => audit_ref = r,
-                Err(reason) => refusal = Some(reason),
+        let audit_ref = match admit_viewer(&ph.token, &ph.id).await {
+            Ok(r) => r,
+            Err(reason) => {
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    other_failure: reason.into(),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
             }
-        }
-        if let Some(reason) = refusal.or(not_admitted) {
+        };
+        if let Some(reason) = self.pm.admission.refusal(&self.pm.db, &ph.id).await {
             log::trace!("punch hole to {} refused: {}", ph.id, reason);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -4418,6 +4420,19 @@ mod tests {
             let (msg, to) = rs.handle_punch_hole_request(addr, punch("adm_ph_anon", ""), "", false).await.unwrap();
             assert!(to.is_none());
             assert!(msg.punch_hole_response().other_failure.contains("not logged in"));
+        }
+
+        #[tokio::test]
+        async fn punch_hole_with_a_fake_token_to_a_pending_device_gets_the_login_refusal() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, _rx) = test_server_with_sk().await;
+            rs.pm.admission = crate::admission::DeviceAdmission::new(true);
+            register_peer(&mut rs, "adm_ph_fake", "10.0.0.5:5000").await;
+            set_env(Some(&api_stub(404, "{}").await), true);
+            let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+            let (msg, to) = rs.handle_punch_hole_request(addr, punch("adm_ph_fake", "x"), "", false).await.unwrap();
+            assert!(to.is_none());
+            assert!(msg.punch_hole_response().other_failure.contains("session expired"));
         }
 
         #[tokio::test]
