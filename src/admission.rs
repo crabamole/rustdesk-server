@@ -103,4 +103,11 @@ mod tests {
         a.cache.lock().await.get_mut("d_late").unwrap().1 -= CACHE_TTL;
         assert_eq!(a.refusal(&db, "d_late").await, None);
     }
+
+    #[tokio::test]
+    async fn on_refuses_when_the_database_fails() {
+        let db = db_with("d_db_down", ADMITTED).await;
+        db.pool().close().await;
+        assert_eq!(DeviceAdmission::new(true).refusal(&db, "d_db_down").await, Some(CHECK_FAILED));
+    }
 }
