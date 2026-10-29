@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hbb_common::tokio::sync::OnceCell;
 use sqlx::{Connection, Executor, PgConnection, Row};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt, ReuseDirective};
+use testcontainers::{core::Mount, ContainerAsync, ImageExt, ReuseDirective};
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
@@ -17,11 +17,18 @@ const PRESENCE_FIXTURE: &str = include_str!("../tests/fixtures/hbbs_presence.sql
 /// instead of each test binary invocation starting (and leaking) its own.
 /// Includes the image tag: reuse matches by name, so bumping the tag below
 /// without also updating this name would silently keep reusing the old
-/// container image instead of the new one.
-const CONTAINER_NAME: &str = "rustdesk-server-test-pg-17";
+/// container image instead of the new one. `-tmpfs`: the data directory mount is fixed at
+/// creation too.
+const CONTAINER_NAME: &str = "rustdesk-server-test-pg-17-tmpfs";
 
-/// Databases older than this are considered stale and dropped on startup.
-const STALE_DATABASE_MAX_AGE_SECS: u64 = 60 * 60;
+/// The data directory is a tmpfs of this size, so the test databases never fill the host disk
+/// (a disk volume grew to 14 GB). A test run peaks below 2 GB (some 190 databases of about 9 MB).
+/// A full tmpfs stops Postgres and the tests fail.
+const DATA_TMPFS_SIZE: i64 = 4 * 1024 * 1024 * 1024;
+
+/// A test database with no connection is stale once it is older than this. The age covers the
+/// moment between `CREATE DATABASE` and the first connection of a concurrent test process.
+const STALE_DATABASE_MAX_AGE_SECS: u64 = 10;
 
 struct PgContainer {
     _container: ContainerAsync<Postgres>,
@@ -35,6 +42,11 @@ async fn container() -> &'static PgContainer {
         let container = Postgres::default()
             .with_tag("17-alpine")
             .with_container_name(CONTAINER_NAME)
+            .with_mount(
+                Mount::tmpfs_mount("/var/lib/postgresql/data").with_size_bytes(DATA_TMPFS_SIZE),
+            )
+            // The module's own fsync=off, plus a small WAL (default 1 GB) for the tmpfs.
+            .with_cmd(["-c", "fsync=off", "-c", "max_wal_size=128MB"])
             .with_reuse(ReuseDirective::Always)
             .start()
             .await
@@ -50,7 +62,8 @@ async fn container() -> &'static PgContainer {
     .await
 }
 
-/// Drops test databases created more than [`STALE_DATABASE_MAX_AGE_SECS`] ago.
+/// Drops test databases that have no connection and are older than [`STALE_DATABASE_MAX_AGE_SECS`].
+/// A database in use by a concurrent test process keeps its connections and is not dropped.
 /// Runs once per process, right after the shared container comes up, so a
 /// long-lived reused container doesn't accumulate one database per test run
 /// forever.
@@ -72,7 +85,10 @@ async fn drop_stale_databases(base_url: &str) {
     };
 
     let rows = match admin
-        .fetch_all("SELECT datname FROM pg_database WHERE datname LIKE 'test\\_%'")
+        .fetch_all(
+            "SELECT datname FROM pg_database d WHERE datname LIKE 'test\\_%' \
+             AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
+        )
         .await
     {
         Ok(rows) => rows,
@@ -97,7 +113,7 @@ async fn drop_stale_databases(base_url: &str) {
             continue;
         }
         if let Err(err) = admin
-            .execute(format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)").as_str())
+            .execute(format!("DROP DATABASE IF EXISTS \"{name}\"").as_str())
             .await
         {
             eprintln!("testing::drop_stale_databases: failed to drop \"{name}\", skipping: {err}");
