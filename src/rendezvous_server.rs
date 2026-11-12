@@ -550,6 +550,8 @@ impl RendezvousServer {
                     }
                     // The target never needs the viewer's token.
                     rf.token.clear();
+                    // The device takes these before its own locked settings, so a viewer must not set them.
+                    rf.control_permissions = MessageField::none();
                     let target_id = rf.id.clone();
                     let held_here = self.ws_peers.lock().await.contains_key(&target_id);
                     if !held_here {
@@ -4485,6 +4487,28 @@ mod tests {
                     assert_eq!(rr.controlled_context.conn_audit_ref, "r2");
                     assert!(rr.token.is_empty());
                 }
+                _ => panic!("RequestRelay was not forwarded"),
+            }
+        }
+
+        #[tokio::test]
+        async fn request_relay_does_not_forward_the_viewers_control_permissions() {
+            let _guard = EnvGuard::acquire().await;
+            let (mut rs, mut rx) = test_server_with_sk().await;
+            register_peer(&mut rs, "relay_perm_tgt", "10.0.0.5:9000").await;
+            let mut sink = None;
+            let mut msg = RendezvousMessage::parse_from_bytes(&relay_bytes("relay_perm_tgt", "tok")).unwrap();
+            let mut rf = msg.request_relay().clone();
+            rf.control_permissions = MessageField::some(ControlPermissions { permissions: 2 << 6, ..Default::default() });
+            msg.set_request_relay(rf);
+
+            set_env(Some(&api_stub(200, r#"{"ref":"r3"}"#).await), true);
+            let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+            let result = rs.handle_tcp(&msg.write_to_bytes().unwrap(), &mut sink, addr, "", false).await;
+
+            assert!(result.0);
+            match rx.try_recv() {
+                Ok(Data::Msg(msg, _)) => assert!(msg.request_relay().control_permissions.is_none()),
                 _ => panic!("RequestRelay was not forwarded"),
             }
         }
